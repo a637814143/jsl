@@ -19,20 +19,18 @@ Usage examples
 
 * 仅运行身份鉴别与安全审计::
 
-      python scripts/linux_compliance_checker.py --include-module identity \
-          --include-module audit
+      python scripts/linux_compliance_checker.py --include-module identity,audit
 
 * 跳过入侵防范模块::
 
-      python scripts/linux_compliance_checker.py --exclude-module intrusion_prevention
+      python scripts/linux_compliance_checker.py --exclude-module intrusion_prevention,malware_protection
 
 """
 
-from __future__ import annotations
-
 import argparse
 import sys
-from typing import Dict, Iterable, List, Set
+from datetime import datetime, timedelta
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 
 # 供 CLI 使用的模块索引，键名称与之前被注释掉的 CHECK_ITEMS 结构保持一致。
@@ -42,6 +40,36 @@ CHECK_MODULES: Dict[str, Dict[str, str]] = {
     "audit": {"title": "8.1.4.3 安全审计"},
     "intrusion_prevention": {"title": "8.1.4.4 入侵防范"},
     "malware_protection": {"title": "8.1.4.5 恶意代码防范"},
+}
+
+# 每个模块对应的检查函数，名称与 LinuxComplianceChecker 中的方法一致。
+MODULE_METHODS: Dict[str, List[str]] = {
+    "identity": [
+        "check_ces1_01_identity_authentication",
+        "check_ces1_02_login_failure_handling",
+        "check_ces1_03_remote_management_security",
+        "check_ces1_04_multi_factor_auth",
+    ],
+    "access_control": [
+        "check_ces1_05_account_allocation",
+        "check_ces1_06_default_account_management",
+        "check_ces1_07_account_review",
+        "check_ces1_08_privilege_separation",
+        "check_ces1_11_security_labels",
+    ],
+    "audit": [
+        "check_ces1_12_audit_enablement",
+        "check_ces1_13_audit_log_content",
+        "check_ces1_14_audit_log_protection",
+    ],
+    "intrusion_prevention": [
+        "check_ces1_17_minimal_installation",
+        "check_ces1_18_service_port_control",
+        "check_ces1_19_management_access_control",
+    ],
+    "malware_protection": [
+        "check_ces1_23_malware_protection",
+    ],
 }
 
 
@@ -56,47 +84,60 @@ def _normalise(raw_values: Iterable[str]) -> List[str]:
     return values
 
 
-def _validate_modules(modules: Iterable[str]) -> Set[str]:
-    """Ensure requested模块存在，若不存在则抛出带提示的异常。"""
+def _validate_modules(modules: Iterable[str]) -> List[str]:
+    """Ensure requested模块存在并保持调用顺序。"""
 
-    modules_set = set(modules)
-    unknown = modules_set - CHECK_MODULES.keys()
+    normalised = _normalise(modules)
+    if not normalised:
+        return []
+
+    unknown = set(normalised) - CHECK_MODULES.keys()
     if unknown:
-        available = ", ".join(sorted(CHECK_MODULES))
+        available = ", ".join(CHECK_MODULES.keys())
         names = ", ".join(sorted(unknown))
         raise ValueError(
             f"未知模块: {names}。可用模块包括: {available}."
         )
-    return modules_set
+
+    seen: Set[str] = set()
+    ordered: List[str] = []
+    for module in normalised:
+        if module in seen:
+            continue
+        seen.add(module)
+        ordered.append(module)
+    return ordered
 
 
 def _determine_selection(include: Iterable[str], exclude: Iterable[str]) -> List[str]:
     """Return最终需要执行的模块列表。"""
 
-    include_set = _validate_modules(_normalise(include)) if include else None
-    exclude_set = _validate_modules(_normalise(exclude)) if exclude else set()
+    include_list = _validate_modules(include) if include else []
+    exclude_list = _validate_modules(exclude) if exclude else []
+    exclude_set = set(exclude_list)
 
-    available = set(CHECK_MODULES.keys())
-    if include_set is not None:
-        selection = include_set
+    if include_list:
+        selection = [module for module in include_list if module not in exclude_set]
     else:
-        selection = available
-
-    selection -= exclude_set
+        selection = [
+            module for module in CHECK_MODULES.keys() if module not in exclude_set
+        ]
 
     if not selection:
         raise ValueError("根据 include/exclude 参数过滤后没有剩余模块可供检查。")
 
-    return sorted(selection)
+    return selection
 
 
-def run_placeholder_checks(selected_modules: Iterable[str]) -> None:
-    """输出占位信息，提示真实检查逻辑仍处于注释状态。"""
+def run_selected_modules(selected_modules: List[str]) -> int:
+    """执行指定模块的检查及整改流程。"""
 
-    for module in selected_modules:
-        title = CHECK_MODULES[module]["title"]
-        print(f"[占位执行] 模块 {module} - {title}")
-        print("  -> 详细检查逻辑当前已被注释保留，仅提供接口示例。\n")
+    checker = LinuxComplianceChecker()
+    if not checker.check_root_privilege():
+        return 1
+
+    checker.run_check(selected_modules)
+    return 0
 
 
 def parse_args(argv: List[str]) -> argparse.Namespace:
@@ -107,13 +148,13 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
         "--include-module",
         action="append",
         default=[],
-        help="仅执行指定模块，可重复或逗号分隔",
+        help="仅执行指定模块，使用逗号分隔多个模块",
     )
     parser.add_argument(
         "--exclude-module",
         action="append",
         default=[],
-        help="跳过指定模块，可重复或逗号分隔",
+        help="跳过指定模块，使用逗号分隔多个模块",
     )
     parser.add_argument(
         "--list-modules",
@@ -123,13 +164,17 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def main(argv: List[str] | None = None) -> int:
-    args = parse_args(argv or sys.argv[1:])
+def main(argv: Optional[List[str]] = None) -> int:
+    args = parse_args(argv if argv is not None else sys.argv[1:])
 
     if args.list_modules:
         print("支持的模块如下：")
         for key, meta in CHECK_MODULES.items():
-            print(f"  - {key}: {meta['title']}")
+            emphasised_title = (
+                LinuxComplianceChecker.emphasise_primary_text(meta.get('title', ''))
+                or meta.get('title', '')
+            )
+            print(f"  - {key}: {emphasised_title}")
         return 0
 
     try:
@@ -138,13 +183,7 @@ def main(argv: List[str] | None = None) -> int:
         print(f"错误: {exc}", file=sys.stderr)
         return 1
 
-    run_placeholder_checks(selected_modules)
-    return 0
-
-
-if __name__ == "__main__":  # pragma: no cover - CLI 入口
-    sys.exit(main())
-
+    return run_selected_modules(selected_modules)
 
 # #!/usr/bin/env python3
 # # -*- coding: utf-8 -*-
@@ -156,6 +195,8 @@ import grp
 import spwd
 import shutil
 import stat
+import socket
+import struct
 import subprocess
 from datetime import datetime
 from getpass import getpass
@@ -171,6 +212,13 @@ class Colors:
     YELLOW = "\033[93m"
     BLUE = "\033[94m"
     CYAN = "\033[96m"
+    BOLD = "\033[1m"
+    BOLD_BLUE = "\033[1;34m"
+    BOLD_CYAN = "\033[1;36m"
+    BOLD_MAGENTA = "\033[1;35m"
+    BOLD_GREEN = "\033[1;32m"
+    BOLD_RED = "\033[1;31m"
+    BOLD_YELLOW = "\033[1;33m"
     END = "\033[0m"
 
 
@@ -557,6 +605,7 @@ class LinuxComplianceChecker:
         self.remediation_records: List[Dict[str, object]] = []
         self.remediation_report_path: Optional[str] = None
         self.apt_cache_refreshed = False
+        self.selected_modules: List[str] = list(MODULE_METHODS.keys())
 
         self.item_metadata: Dict[str, Dict[str, object]] = {}
         self.item_categories: Dict[str, str] = {}
@@ -660,6 +709,61 @@ class LinuxComplianceChecker:
 
         return None
 
+    def describe_package_installation(self, package: str) -> Optional[str]:
+        """Return a human-readable summary for an installed package."""
+
+        manager = self.package_manager or self.detect_package_manager()
+        if not manager:
+            return None
+
+        self.package_manager = manager
+
+        if manager == "dpkg":
+            rc, stdout, _ = self.run_command(
+                f"dpkg-query -W -f='${{Version}} ${{Architecture}}' {package}"
+            )
+            if rc == 0:
+                summary = stdout.strip()
+                if summary:
+                    return f"{package} {summary}"
+                return package
+            return None
+
+        if manager == "rpm":
+            rc, stdout, _ = self.run_command(
+                f"rpm -q --qf '%{{NAME}} %{{VERSION}}-%{{RELEASE}} %{{ARCH}}' {package}"
+            )
+            if rc == 0:
+                return stdout.strip()
+            return None
+
+        if manager == "pacman":
+            rc, stdout, _ = self.run_command(f"pacman -Qi {package}")
+            if rc == 0:
+                version = ""
+                arch = ""
+                for line in stdout.splitlines():
+                    if line.startswith("Version"):
+                        version = line.split(" : ", 1)[-1].strip()
+                    if line.startswith("Architecture"):
+                        arch = line.split(" : ", 1)[-1].strip()
+                details = f"{package} {version}".strip()
+                if arch:
+                    details = f"{details} {arch}".strip()
+                return details or package
+            return None
+
+        if manager == "apk":
+            rc, stdout, _ = self.run_command(f"apk info -e {package}")
+            if rc == 0:
+                for line in stdout.splitlines():
+                    if line.startswith(package):
+                        return line.strip()
+                return package
+            return None
+
+        return None
+
     @staticmethod
     def read_file(path: str) -> Optional[str]:
         try:
@@ -674,8 +778,9 @@ class LinuxComplianceChecker:
             result = subprocess.run(
                 command,
                 shell=True,
-                capture_output=True,
-                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                universal_newlines=True,
                 timeout=timeout,
             )
             return result.returncode, result.stdout.strip(), result.stderr.strip()
@@ -683,10 +788,108 @@ class LinuxComplianceChecker:
             return -1, "", str(exc)
 
     @staticmethod
+    def message_indicates_missing_service(message: str) -> bool:
+        if not message:
+            return False
+
+        lowered = message.lower()
+        keywords = [
+            "no such file or directory",
+            "could not be found",
+            "not found",
+            "unrecognized service",
+            "unknown service",
+            "loaded: not-found",
+        ]
+        return any(keyword in lowered for keyword in keywords)
+
+    @staticmethod
+    def message_indicates_systemd_unavailable(message: str) -> bool:
+        if not message:
+            return False
+
+        lowered = message.lower()
+        return "system has not been booted with systemd" in lowered or "failed to connect to bus" in lowered
+
+    @staticmethod
     def command_has_placeholder(command: str) -> bool:
         """Check whether a suggested command contains obvious placeholders."""
 
         return any(token in command for token in ("<", "…", "..."))
+
+    @staticmethod
+    def summarise_command_output(
+        output: str, max_lines: int = 3, max_chars: int = 200
+    ) -> str:
+        """Condense command output so it can be embedded into remediation笔记."""
+
+        if not output:
+            return ""
+
+        lines = [line.strip() for line in output.splitlines() if line.strip()]
+        if not lines:
+            return ""
+
+        truncated = False
+        if len(lines) > max_lines:
+            lines = lines[:max_lines]
+            truncated = True
+
+        summary = "; ".join(lines)
+        if len(summary) > max_chars:
+            summary = summary[:max_chars].rstrip()
+            truncated = True
+
+        if truncated:
+            summary += " …"
+
+        return summary
+
+    @staticmethod
+    def extract_pam_policy_tokens(line: str) -> List[str]:
+        """Return significant option tokens from a PAM faillock/tally2配置行."""
+
+        if not line:
+            return []
+
+        match = re.search(r"pam_(?:faillock|tally2)\.so(.*)", line)
+        if not match:
+            return []
+
+        trailing = match.group(1)
+        if not trailing:
+            return []
+
+        tokens: List[str] = []
+        for raw_token in trailing.split():
+            cleaned = raw_token.strip().strip(",")
+            if not cleaned:
+                continue
+            if "=" in cleaned:
+                tokens.append(cleaned)
+                continue
+            if cleaned in {"even_deny_root", "even_deny_non_root", "silent", "audit"}:
+                tokens.append(cleaned)
+
+        return tokens
+
+    @staticmethod
+    def safe_getpwuid(uid: int) -> str:
+        try:
+            return pwd.getpwuid(uid).pw_name
+        except KeyError:
+            return str(uid)
+        except Exception:  # pylint: disable=broad-except
+            return str(uid)
+
+    @staticmethod
+    def safe_getgrgid(gid: int) -> str:
+        try:
+            return grp.getgrgid(gid).gr_name
+        except KeyError:
+            return str(gid)
+        except Exception:  # pylint: disable=broad-except
+            return str(gid)
 
     @staticmethod
     def normalise_service_candidate(name: str) -> str:
@@ -779,9 +982,169 @@ class LinuxComplianceChecker:
         return settings
 
     @staticmethod
+    def parse_colon_key_values(text: str) -> Dict[str, str]:
+        fields: Dict[str, str] = {}
+        for line in text.splitlines():
+            if ":" not in line:
+                continue
+            key, value = line.split(":", 1)
+            key = key.strip()
+            value = value.strip()
+            if not key:
+                continue
+            fields[key] = value
+        return fields
+
+    @staticmethod
     def days_since_epoch() -> int:
         epoch = datetime(1970, 1, 1)
         return (datetime.now() - epoch).days
+
+    @staticmethod
+    def describe_password_hash(hash_field: str) -> str:
+        if hash_field is None:
+            return "未提供口令字段"
+
+        field = hash_field.strip()
+        if field == "":
+            return "空口令"
+
+        locked = False
+        while field.startswith("!") or field.startswith("*"):
+            locked = True
+            field = field[1:]
+        if field == "":
+            return "账户已锁定/禁用"
+
+        algorithm_map = {
+            "1": "MD5",
+            "2a": "Blowfish",
+            "5": "SHA-256",
+            "6": "SHA-512",
+            "y": "yescrypt",
+            "gy": "gost-yescrypt",
+            "apr1": "Apache MD5",
+            "bcrypt": "bcrypt",
+        }
+
+        algorithm = "传统DES散列"
+        if field.startswith("$"):
+            parts = field.split("$")
+            if len(parts) > 2:
+                alg_id = parts[1]
+                algorithm = algorithm_map.get(alg_id, f"算法ID {alg_id}")
+        preview = field[:16] + ("..." if len(field) > 16 else "")
+        status_parts = [algorithm, f"哈希前缀: {preview}"]
+        if locked:
+            status_parts.append("账户已锁定/禁用")
+        return ", ".join(status_parts)
+
+    @staticmethod
+    def describe_shadow_change(last_change_int: Optional[int], now_days: int) -> str:
+        if last_change_int is None or last_change_int <= 0:
+            return "最后改密时间未知"
+        change_date = datetime(1970, 1, 1) + timedelta(days=last_change_int)
+        days_ago = max(0, now_days - last_change_int)
+        return f"最后改密 {change_date.strftime('%Y-%m-%d')} ({days_ago} 天前)"
+
+    @staticmethod
+    def describe_shadow_expiry(expire_int: Optional[int], now_days: int) -> str:
+        if expire_int is None or expire_int <= 0:
+            return "未设置到期日"
+        expire_date = datetime(1970, 1, 1) + timedelta(days=expire_int)
+        delta = expire_int - now_days
+        if delta >= 0:
+            return f"预计到期 {expire_date.strftime('%Y-%m-%d')} (剩余 {delta} 天)"
+        return f"已于 {expire_date.strftime('%Y-%m-%d')} 到期 ({-delta} 天前)"
+
+    @staticmethod
+    def resolve_group_name(gid: int) -> str:
+        try:
+            return grp.getgrgid(gid).gr_name
+        except KeyError:
+            return f"GID {gid}"
+
+    def describe_account_overview(
+        self,
+        username: str,
+        entry: Optional[pwd.struct_passwd],
+        info: Dict[str, object],
+        now_days: int,
+    ) -> str:
+        parts: List[str] = []
+
+        if entry is not None:
+            group_name = self.resolve_group_name(entry.pw_gid)
+            parts.append(f"UID {entry.pw_uid}")
+            parts.append(f"主组 {group_name} (GID {entry.pw_gid})")
+            parts.append(f"家目录 {entry.pw_dir}")
+            parts.append(f"Shell {entry.pw_shell}")
+        else:
+            parts.append("未在/etc/passwd中找到对应账户信息")
+
+        password_summary = info.get("password_summary")
+        if isinstance(password_summary, str) and password_summary:
+            parts.append(password_summary)
+        elif entry is not None:
+            parts.append("未在/etc/shadow找到口令摘要")
+
+        last_change_desc = info.get("last_change_desc")
+        last_change_int = info.get("last_change_int")
+        if not last_change_desc and isinstance(last_change_int, int):
+            last_change_desc = self.describe_shadow_change(last_change_int, now_days)
+        if isinstance(last_change_desc, str) and last_change_desc:
+            parts.append(last_change_desc)
+        else:
+            parts.append("最后改密时间未知")
+
+        expire_desc = info.get("expire_desc")
+        expire_int = info.get("expire_int")
+        if not expire_desc and isinstance(expire_int, int):
+            expire_desc = self.describe_shadow_expiry(expire_int, now_days)
+        if isinstance(expire_desc, str) and expire_desc:
+            parts.append(expire_desc)
+        else:
+            parts.append("未设置到期日")
+
+        flags = info.get("flags")
+        if isinstance(flags, list):
+            for flag in flags:
+                if flag:
+                    parts.append(flag)
+
+        return f"{username}: " + "; ".join(parts)
+
+    @staticmethod
+    def summarize_rotation(username: str, info: Dict[str, object]) -> str:
+        parts: List[str] = []
+        last_change_desc = info.get("last_change_desc")
+        if isinstance(last_change_desc, str) and last_change_desc:
+            parts.append(last_change_desc)
+        else:
+            parts.append("最后改密时间未知")
+
+        max_days_int = info.get("max_days_int")
+        if isinstance(max_days_int, int):
+            parts.append(f"有效期 {max_days_int} 天")
+        else:
+            raw = info.get("max_days_raw")
+            if raw:
+                parts.append(f"有效期字段={raw}")
+            else:
+                parts.append("未配置有效期字段")
+
+        days_remaining = info.get("days_remaining")
+        if isinstance(days_remaining, int):
+            if days_remaining >= 0:
+                parts.append(f"剩余 {days_remaining} 天")
+            else:
+                parts.append(f"已超期 {-days_remaining} 天")
+
+        issues = info.get("flags")
+        if isinstance(issues, list) and issues:
+            parts.extend(issues)
+
+        return f"{username}: {', '.join(parts)}"
 
     @staticmethod
     def make_subitem(description: str) -> Dict[str, object]:
@@ -826,7 +1189,9 @@ class LinuxComplianceChecker:
         """Gather all failing subitems that require remediation."""
 
         targets: List[Dict[str, object]] = []
-        for category in CHECK_ITEMS.values():
+        active_modules = self.selected_modules or list(MODULE_METHODS.keys())
+        for module in active_modules:
+            category = CHECK_ITEMS.get(module, {})
             title = category.get("title", "")
             for item_id, metadata in category.get("items", {}).items():
                 result = self.results.get(
@@ -898,31 +1263,52 @@ class LinuxComplianceChecker:
         for index, target in enumerate(targets, 1):
             description = target["subitem"].get("description", "")
             status = target["result_status"]
+            emphasised_desc = (
+                self.emphasise_primary_text(description) or description
+            )
             print(
-                f" {index}. {target['item_id']} - {description} (当前状态: {status})"
+                f" {index}. {target['item_id']} - {emphasised_desc} (当前状态: {status})"
             )
 
         print()
         for index, target in enumerate(targets, 1):
             subitem = target["subitem"]
             description = subitem.get("description", "")
+            heading_text = f"整改项 {index}: {target['item_id']}"
+            initial_status = target.get("result_status")
+            if initial_status:
+                heading_text = f"{heading_text} · {initial_status}"
             print(
-                f"{Colors.BLUE}整改项 {index}: {target['item_id']} - {description}{Colors.END}"
+                self.render_heading(
+                    heading_text,
+                    level=2,
+                    colour=Colors.BOLD_BLUE,
+                )
             )
+            emphasised_desc = self.emphasise_primary_text(description) or description
+            print(f"   子项描述: {emphasised_desc}")
             if target.get("indicator"):
-                print(f"   测评指标: {target['indicator']}")
+                indicator_text = (
+                    self.emphasise_primary_text(target["indicator"]) or target["indicator"]
+                )
+                print(f"   测评指标: {indicator_text}")
             if target.get("implementation_text"):
-                print(f"   对应实施要点: {target['implementation_text']}")
+                implementation_text = (
+                    self.emphasise_primary_text(target["implementation_text"])
+                    or target["implementation_text"]
+                )
+                print(f"   对应实施要点: {implementation_text}")
             details = subitem.get("details", [])
             if details:
-                print("   当前问题:")
+                print(f"   {Colors.BOLD}当前问题:{Colors.END}")
                 for detail in details:
                     print(f"     - {detail}")
             recommendations = subitem.get("recommendation", [])
             if recommendations:
-                print("   推荐整改措施:")
+                print(f"   {Colors.BOLD}推荐整改措施:{Colors.END}")
                 for rec in recommendations:
-                    print(f"     * {rec}")
+                    emphasised_rec = self.emphasise_primary_text(rec) or rec
+                    print(f"     * {emphasised_rec}")
 
             record = {
                 "item_id": target["item_id"],
@@ -945,9 +1331,7 @@ class LinuxComplianceChecker:
             record["status"] = status
             record["notes"] = notes
             self.remediation_records.append(record)
-            print(
-                f"   -> 整改结果: {self.format_status_label(status)}"
-            )
+            print(f"   -> 整改结果: {self.format_status_label(status)}")
             for note in notes:
                 print(f"      {note}")
 
@@ -1011,16 +1395,24 @@ class LinuxComplianceChecker:
 
         step_notes: List[str] = ["已启动交互式手动整改流程。"]
         for index, step in enumerate(steps, 1):
-            print(f"   步骤{index}: {step}")
+            print()
+            step_heading = self.render_heading(f"步骤 {index}", level=3, indent=3)
+            if step_heading:
+                print(step_heading)
+            emphasised_step = self.emphasise_primary_text(step) or step
+            print(f"      {emphasised_step}")
             step_notes.append(f"步骤{index}: {step}")
             commands = re.findall(r"`([^`]+)`", step)
             if not commands:
-                try:
-                    response = input(
-                        "     完成上述操作后按回车继续，或输入 skip 跳过: "
+                response = self.safe_input(
+                    "      完成上述操作后按回车继续，或输入 skip 跳过: "
+                )
+                if response is None:
+                    step_notes.append(
+                        "终端输入被中断（可能是 Ctrl+C/Ctrl+D），该步骤暂未执行。"
                     )
-                except EOFError:
-                    response = "skip"
+                    step_notes.append("用户暂未执行该步骤，需后续复核。")
+                    continue
 
                 if response.strip().lower() in {"skip", "s"}:
                     step_notes.append("用户暂未执行该步骤，需后续复核。")
@@ -1035,32 +1427,34 @@ class LinuxComplianceChecker:
                 has_placeholder = self.command_has_placeholder(suggested)
                 if has_placeholder:
                     print(
-                        "     建议命令包含占位符，请根据实际情况提供具体命令。"
+                        "      建议命令包含占位符，请根据实际情况提供具体命令。"
                     )
                 else:
-                    print(f"     建议执行命令: {suggested}")
+                    emphasised_command = self.emphasise_primary_text(suggested) or suggested
+                    print(f"      建议执行命令: {emphasised_command}")
 
                 while True:
-                    try:
-                        if has_placeholder:
-                            prompt = (
-                                "     请输入要执行的命令（输入 skip 跳过该命令）: "
-                            )
-                        else:
-                            prompt = (
-                                "     按回车执行上述命令，输入自定义命令替换，"
-                                "或输入 skip 跳过: "
-                            )
-                        user_input = input(prompt)
-                    except EOFError:
-                        user_input = "skip"
-
+                    if has_placeholder:
+                        prompt = (
+                            "      请输入要执行的命令（输入 skip 跳过该命令）: "
+                        )
+                    else:
+                        prompt = (
+                            "      按回车执行上述命令，输入自定义命令替换，"
+                            "或输入 skip 跳过: "
+                        )
+                    user_input = self.safe_input(prompt)
                     if user_input is None:
-                        user_input = ""
+                        step_notes.append(
+                            f"命令 `{suggested}` 因用户中断输入而跳过。"
+                        )
+                        step_skipped = True
+                        break
+
                     chosen = user_input.strip()
 
                     if not chosen and has_placeholder:
-                        print("     该命令需要具体参数，请输入命令或输入 skip 跳过。")
+                        print("      该命令需要具体参数，请输入命令或输入 skip 跳过。")
                         continue
 
                     if chosen.lower() in {"skip", "s"}:
@@ -1071,27 +1465,47 @@ class LinuxComplianceChecker:
                         break
 
                     actual_command = chosen or suggested
+                    if actual_command != suggested:
+                        step_notes.append(
+                            f"命令 `{suggested}` 已替换为 `{actual_command}` 执行。"
+                        )
                     rc, stdout, stderr = self.run_command(actual_command)
                     step_notes.append(
                         f"命令 `{actual_command}` 执行返回码 {rc}。"
                     )
                     executed_any_command = True
 
-                    print(f"     -> 返回码: {rc}")
+                    print(f"      -> 返回码: {rc}")
                     if stdout:
                         print("        STDOUT:")
                         for line in stdout.splitlines():
                             print(f"          {line}")
+                        summary = self.summarise_command_output(stdout)
+                        if summary:
+                            step_notes.append(
+                                f"命令 `{actual_command}` STDOUT 摘要: {summary}"
+                            )
                     if stderr:
                         print("        STDERR:")
                         for line in stderr.splitlines():
                             print(f"          {line}")
+                        summary = self.summarise_command_output(stderr)
+                        if summary:
+                            step_notes.append(
+                                f"命令 `{actual_command}` STDERR 摘要: {summary}"
+                            )
 
                     if rc != 0:
                         if self.prompt_user_confirmation(
-                            "     命令执行失败，是否重试？(y/n，回车表示否): "
+                            "      命令执行失败，是否重试？(y/n，回车表示否): "
                         ):
+                            step_notes.append(
+                                f"命令 `{actual_command}` 返回码 {rc}，用户选择重试。"
+                            )
                             continue
+                        step_notes.append(
+                            f"命令 `{actual_command}` 返回码 {rc}，用户放弃重试。"
+                        )
                     break
 
                 if step_skipped:
@@ -1105,7 +1519,7 @@ class LinuxComplianceChecker:
 
             if executed_any_command:
                 if self.prompt_user_confirmation(
-                    "     命令执行完毕，结果是否符合预期？(y/n，回车表示否): "
+                    "      命令执行完毕，结果是否符合预期？(y/n，回车表示否): "
                 ):
                     step_notes.append("用户确认命令执行结果符合预期。")
                 else:
@@ -1125,6 +1539,12 @@ class LinuxComplianceChecker:
                 step_notes.append("• 完成整改后请确认：")
                 step_notes.extend(f"  - {text}" for text in recommendations)
 
+        extra_note = self.prompt_optional_text(
+            "   如需补充说明或记录后续计划，请输入（直接回车跳过）: "
+        )
+        if extra_note:
+            step_notes.append(f"补充说明: {extra_note}")
+
         completed = self.prompt_user_confirmation(
             "   是否已完成上述步骤并确认整改符合要求？(y/n，回车表示否): "
         )
@@ -1138,17 +1558,34 @@ class LinuxComplianceChecker:
         return status, step_notes
 
     @staticmethod
-    def prompt_user_confirmation(message: str) -> bool:
+    def safe_input(message: str) -> Optional[str]:
+        """Wrapper around input() that gracefully handles EOF/KeyboardInterrupt."""
+
+        try:
+            return input(message)
+        except (EOFError, KeyboardInterrupt):
+            return None
+
+    def prompt_optional_text(self, message: str) -> Optional[str]:
+        """Collect optional free-form备注 when recording整改情况."""
+
+        response = self.safe_input(message)
+        if response is None:
+            return None
+        cleaned = response.strip()
+        return cleaned or None
+
+    def prompt_user_confirmation(self, message: str) -> bool:
         """Prompt the operator before executing a remediation step."""
 
         while True:
-            try:
-                response = input(message).strip().lower()
-            except EOFError:
+            response = self.safe_input(message)
+            if response is None:
                 return False
-            if response in {"y", "yes", "是"}:
+            choice = response.strip().lower()
+            if choice in {"y", "yes", "是"}:
                 return True
-            if response in {"", "n", "no", "否"}:
+            if choice in {"", "n", "no", "否"}:
                 return False
             print("请输入 y/n 或者 按回车取消。")
 
@@ -1244,6 +1681,57 @@ class LinuxComplianceChecker:
         """Translate remediation状态标签 to Chinese for display."""
 
         return STATUS_LABELS.get(status, status)
+
+    @staticmethod
+    def render_heading(
+        text: str,
+        level: int = 1,
+        indent: int = 0,
+        plain: bool = False,
+        colour: Optional[str] = None,
+    ) -> str:
+        """Render emphasised headings with simple underline gradients to suggest size."""
+
+        sanitized = (text or "").strip()
+        if not sanitized:
+            return ""
+
+        if level <= 1:
+            content = sanitized.upper()
+            underline_char = "="
+            default_colour = Colors.BOLD_BLUE
+        elif level == 2:
+            content = sanitized
+            underline_char = "-"
+            default_colour = Colors.BOLD_CYAN
+        else:
+            content = sanitized
+            underline_char = "~"
+            default_colour = Colors.BOLD_MAGENTA
+
+        prefix = " " * max(indent, 0)
+        lines = [f"{prefix}{content}"]
+
+        underline = underline_char * len(content)
+        if underline:
+            lines.append(f"{prefix}{underline}")
+
+        heading = "\n".join(lines)
+
+        if plain:
+            return heading
+
+        style = colour or default_colour
+        return f"{style}{heading}{Colors.END}"
+
+    @staticmethod
+    def emphasise_primary_text(text: str) -> str:
+        """Format dictionary-sourced content in a visually larger (bold) style."""
+
+        sanitized = (text or "").strip()
+        if not sanitized:
+            return ""
+        return f"{Colors.BOLD}{sanitized}{Colors.END}"
 
     @staticmethod
     def create_backup(path: str) -> Optional[str]:
@@ -2153,26 +2641,17 @@ class LinuxComplianceChecker:
         return True
 
 
-    def run_check(self) -> None:
+    def run_check(self, modules: Optional[List[str]] = None) -> None:
+        active_modules = modules or list(MODULE_METHODS.keys())
+        self.selected_modules = active_modules[:]
+
         print(f"{Colors.CYAN}\n=== 开始三级等保合规检查 ==={Colors.END}")
         print(f"系统信息: {self.os_info['distribution']} {self.os_info['machine']}\n")
 
-        self.check_ces1_01_identity_authentication()
-        self.check_ces1_02_login_failure_handling()
-        self.check_ces1_03_remote_management_security()
-        self.check_ces1_04_multi_factor_auth()
-        self.check_ces1_05_account_allocation()
-        self.check_ces1_06_default_account_management()
-        self.check_ces1_07_account_review()
-        self.check_ces1_08_privilege_separation()
-        self.check_ces1_11_security_labels()
-        self.check_ces1_12_audit_enablement()
-        self.check_ces1_13_audit_log_content()
-        self.check_ces1_14_audit_log_protection()
-        self.check_ces1_17_minimal_installation()
-        self.check_ces1_18_service_port_control()
-        self.check_ces1_19_management_access_control()
-        self.check_ces1_23_malware_protection()
+        for module in active_modules:
+            method_names = MODULE_METHODS.get(module, [])
+            for method_name in method_names:
+                getattr(self, method_name)()
 
         self.generate_report()
         self.run_remediation()
@@ -2207,6 +2686,7 @@ class LinuxComplianceChecker:
             if content is None:
                 missing_pam_files.append(pam_file)
                 continue
+            matched = 0
             for line in content.splitlines():
                 stripped = line.strip()
                 if not stripped or stripped.startswith('#'):
@@ -2215,6 +2695,7 @@ class LinuxComplianceChecker:
                     continue
                 if any(module in stripped for module in auth_modules):
                     auth_lines.append(f"{pam_file}: {stripped}")
+                    matched += 1
         if auth_lines:
             subitems[0]["details"].append("已在PAM配置中检测到身份鉴别模块")
             subitems[0]["details"].extend(auth_lines)
@@ -2224,12 +2705,15 @@ class LinuxComplianceChecker:
             subitems[0]["recommendation"].append(
                 "请检查/etc/pam.d/目录下的认证配置，确保启用了身份鉴别模块"
             )
-        if missing_pam_files:
-            subitems[0]["details"].append("以下PAM配置文件未读取到: " + ", ".join(missing_pam_files))
+        if missing_pam_files and not auth_lines:
+            subitems[0]["details"].append(
+                "以下PAM配置文件未读取到: " + ", ".join(missing_pam_files)
+            )
 
         username_counts: Dict[str, int] = {}
         uid_to_users: Dict[str, List[str]] = {}
         interactive_users: Set[str] = set()
+        account_entries: List[Tuple[str, str, str]] = []
         passwd_data_valid = True
         try:
             with open('/etc/passwd', 'r', encoding='utf-8', errors='ignore') as passwd_file:
@@ -2244,6 +2728,7 @@ class LinuxComplianceChecker:
                     shell = fields[6].strip()
                     username_counts[username] = username_counts.get(username, 0) + 1
                     uid_to_users.setdefault(uid, []).append(username)
+                    account_entries.append((username, uid, shell))
                     if shell in INTERACTIVE_SHELLS:
                         interactive_users.add(username)
         except Exception as exc:  # pylint: disable=broad-except
@@ -2274,6 +2759,28 @@ class LinuxComplianceChecker:
                 )
             else:
                 subitems[1]["details"].append("用户名与UID均唯一")
+                if account_entries:
+                    subitems[1]["details"].append("账户列表(用户名: UID, Shell):")
+                    for username, uid, shell in sorted(
+                        account_entries,
+                        key=lambda entry: (
+                            int(entry[1]) if entry[1].isdigit() else float('inf'),
+                            entry[0],
+                        ),
+                    ):
+                        shell_note = (
+                            f"{shell} (交互式)"
+                            if shell in INTERACTIVE_SHELLS
+                            else shell
+                        )
+                        subitems[1]["details"].append(
+                            f" - {username}: {uid} ({shell_note})"
+                        )
+                    subitems[1]["details"].append(
+                        f"共计 {len(account_entries)} 个账户参与核查"
+                    )
+
+        interactive_hash_summaries: Dict[str, str] = {}
 
         if not passwd_data_valid:
             subitems[2]["status"] = "ERROR"
@@ -2286,8 +2793,15 @@ class LinuxComplianceChecker:
                         if not line.strip() or ':' not in line:
                             continue
                         fields = line.split(':')
-                        if len(fields) > 1 and fields[1] == '':
-                            username = fields[0]
+                        if len(fields) < 2:
+                            continue
+                        username = fields[0]
+                        password_field = fields[1]
+                        if username in interactive_users:
+                            interactive_hash_summaries[username] = self.describe_password_hash(
+                                password_field
+                            )
+                        if password_field == '':
                             if username in interactive_users:
                                 empty_password_users.append(username)
             except PermissionError as exc:
@@ -2305,7 +2819,25 @@ class LinuxComplianceChecker:
                     )
                     subitems[2]["recommendation"].append("请为相关用户设置强密码或禁用账户")
                 else:
-                    subitems[2]["details"].append("未检测到空口令账户")
+                    if interactive_users:
+                        subitems[2]["details"].append(
+                            "未检测到空口令账户，以下可交互用户均设置了口令:"
+                        )
+                        for username in sorted(interactive_users):
+                            summary = interactive_hash_summaries.get(
+                                username,
+                                "未在/etc/shadow找到对应条目",
+                            )
+                            subitems[2]["details"].append(
+                                f" - {username}: {summary}"
+                            )
+                        subitems[2]["details"].append(
+                            f"共核查 {len(interactive_users)} 个可交互账户"
+                        )
+                    else:
+                        subitems[2]["details"].append(
+                            "未检测到空口令账户，系统中不存在可交互登录账户"
+                        )
 
         pwquality_conf = self.read_file('/etc/security/pwquality.conf')
         pwquality_settings: Dict[str, str] = {}
@@ -2378,12 +2910,24 @@ class LinuxComplianceChecker:
             pass_min = re.search(r'PASS_MIN_DAYS\s+(\d+)', login_defs)
             pass_warn = re.search(r'PASS_WARN_AGE\s+(\d+)', login_defs)
             issues = []
-            if not pass_max or int(pass_max.group(1)) > 90:
-                issues.append("PASS_MAX_DAYS 应配置为不大于90")
-            if not pass_min or int(pass_min.group(1)) < 7:
-                issues.append("PASS_MIN_DAYS 应配置为不小于7")
-            if not pass_warn or int(pass_warn.group(1)) < 7:
-                issues.append("PASS_WARN_AGE 应配置为不小于7")
+            if not pass_max:
+                issues.append("未找到 PASS_MAX_DAYS 配置")
+            else:
+                max_value = int(pass_max.group(1))
+                if max_value > 90:
+                    issues.append(f"PASS_MAX_DAYS 当前值为 {max_value}，应不大于90")
+            if not pass_min:
+                issues.append("未找到 PASS_MIN_DAYS 配置")
+            else:
+                min_value = int(pass_min.group(1))
+                if min_value < 7:
+                    issues.append(f"PASS_MIN_DAYS 当前值为 {min_value}，应不小于7")
+            if not pass_warn:
+                issues.append("未找到 PASS_WARN_AGE 配置")
+            else:
+                warn_value = int(pass_warn.group(1))
+                if warn_value < 7:
+                    issues.append(f"PASS_WARN_AGE 当前值为 {warn_value}，应不小于7")
             if issues:
                 rotation_policy_ok = False
                 subitems[4]["status"] = "FAIL"
@@ -2393,6 +2937,18 @@ class LinuxComplianceChecker:
                 )
             else:
                 subitems[4]["details"].append("密码有效期策略配置满足90/7/7要求")
+                configured_values: List[str] = []
+                if pass_max:
+                    configured_values.append(f"PASS_MAX_DAYS={pass_max.group(1)}")
+                if pass_min:
+                    configured_values.append(f"PASS_MIN_DAYS={pass_min.group(1)}")
+                if pass_warn:
+                    configured_values.append(f"PASS_WARN_AGE={pass_warn.group(1)}")
+                if configured_values:
+                    subitems[4]["details"].append(
+                        "检测到以下/etc/login.defs配置: "
+                        + ", ".join(configured_values)
+                    )
 
         if rotation_policy_ok:
             shadow_content = self.read_file('/etc/shadow')
@@ -2401,6 +2957,7 @@ class LinuxComplianceChecker:
                 overdue_users: List[str] = []
                 missing_limit_users: List[str] = []
                 login_users = self.get_login_users()
+                per_user_rotation_info: Dict[str, Dict[str, object]] = {}
                 for line in shadow_content.splitlines():
                     if not line or ':' not in line:
                         continue
@@ -2410,40 +2967,87 @@ class LinuxComplianceChecker:
                         continue
                     max_days = fields[4] if len(fields) > 4 else ''
                     last_change = fields[2] if len(fields) > 2 else ''
+                    info: Dict[str, object] = {
+                        "max_days_raw": max_days,
+                        "last_change_raw": last_change,
+                        "flags": [],
+                    }
+                    max_days_int: Optional[int] = None
+                    if max_days and max_days not in {'', '-1', '99999'}:
+                        try:
+                            max_days_int = int(max_days)
+                        except ValueError:
+                            max_days_int = None
+                    info["max_days_int"] = max_days_int
                     if not max_days or max_days in {'', '-1', '99999'}:
                         missing_limit_users.append(username)
-                        continue
-                    try:
-                        max_days_int = int(max_days)
-                    except ValueError:
+                        info.setdefault("flags", []).append("未设置有效期上限")
+                    elif max_days_int is None:
                         missing_limit_users.append(username)
-                        continue
-                    if max_days_int > 90:
+                        info.setdefault("flags", []).append("有效期字段无法解析")
+                    elif max_days_int > 90:
                         missing_limit_users.append(username)
-                        continue
+                        info.setdefault("flags", []).append(
+                            f"有效期 {max_days_int} 天，大于90天限制"
+                        )
                     try:
                         last_change_int = int(last_change)
                     except ValueError:
-                        continue
-                    if last_change_int > 0 and max_days_int > 0:
-                        if now_days - last_change_int > max_days_int:
-                            overdue_users.append(username)
+                        last_change_int = None
+                    info["last_change_int"] = last_change_int
+                    if last_change_int is not None:
+                        info["last_change_desc"] = self.describe_shadow_change(
+                            last_change_int, now_days
+                        )
+                        days_since_change = max(0, now_days - last_change_int)
+                        info["days_since_change"] = days_since_change
+                        if isinstance(max_days_int, int):
+                            info["days_remaining"] = max_days_int - days_since_change
+                            if days_since_change > max_days_int:
+                                overdue_users.append(username)
+                                info.setdefault("flags", []).append(
+                                    f"已超期 {days_since_change - max_days_int} 天"
+                                )
+                    else:
+                        info.setdefault("flags", []).append("缺少最后改密日期")
+                    per_user_rotation_info[username] = info
                 if missing_limit_users:
                     subitems[4]["status"] = "FAIL"
-                    subitems[4]["details"].append(
-                        "以下用户未设置合理的密码有效期: "
-                        + ", ".join(sorted(set(missing_limit_users)))
-                    )
+                    subitems[4]["details"].append("以下用户未设置合理的密码有效期:")
+                    for username in sorted(set(missing_limit_users)):
+                        info = per_user_rotation_info.get(username, {})
+                        subitems[4]["details"].append(
+                            f" - {self.summarize_rotation(username, info)}"
+                        )
                     subitems[4]["recommendation"].append(
                         "请使用chage命令为上述账户配置密码有效期"
                     )
                 if overdue_users:
                     subitems[4]["status"] = "FAIL"
-                    subitems[4]["details"].append(
-                        "以下用户密码已超过允许的有效期: "
-                        + ", ".join(sorted(set(overdue_users)))
-                    )
+                    subitems[4]["details"].append("以下用户密码已超过允许的有效期:")
+                    for username in sorted(set(overdue_users)):
+                        info = per_user_rotation_info.get(username, {})
+                        subitems[4]["details"].append(
+                            f" - {self.summarize_rotation(username, info)}"
+                        )
                     subitems[4]["recommendation"].append("请立即通知相关用户修改密码")
+                if subitems[4]["status"] == "PASS":
+                    if login_users:
+                        subitems[4]["details"].append(
+                            "已核查以下登录账户的密码有效期:"
+                        )
+                        for username in sorted(login_users):
+                            info = per_user_rotation_info.get(username, {})
+                            subitems[4]["details"].append(
+                                f" - {self.summarize_rotation(username, info)}"
+                            )
+                        subitems[4]["details"].append(
+                            f"共核查 {len(login_users)} 个登录账户"
+                        )
+                    else:
+                        subitems[4]["details"].append(
+                            "系统未检出需要密码有效期控制的登录账户"
+                        )
             else:
                 subitems[4]["status"] = "ERROR"
                 subitems[4]["details"].append("无法读取/etc/shadow，无法核查密码有效期执行情况")
@@ -2465,6 +3069,7 @@ class LinuxComplianceChecker:
         ]
         faillock_lines: List[str] = []
         faillock_with_policy = False
+        faillock_policy_entries: List[Tuple[str, str, List[str]]] = []
         for pam_file in pam_files:
             content = self.read_file(pam_file)
             if not content:
@@ -2475,10 +3080,19 @@ class LinuxComplianceChecker:
                     continue
                 if "pam_faillock.so" in stripped or "pam_tally2.so" in stripped:
                     faillock_lines.append(f"{pam_file}: {stripped}")
-                    if re.search(r"deny=\d+", stripped) and (
-                        re.search(r"unlock_time=\d+", stripped) or "even_deny_root" in stripped
-                    ):
+                    module_name = (
+                        "pam_faillock.so" if "pam_faillock.so" in stripped else "pam_tally2.so"
+                    )
+                    options = self.extract_pam_policy_tokens(stripped)
+                    has_deny = any(token.startswith("deny=") for token in options)
+                    has_unlock_or_flag = any(
+                        token.startswith("unlock_time=") for token in options
+                    ) or any(
+                        token in {"even_deny_root", "even_deny_non_root"} for token in options
+                    )
+                    if has_deny and has_unlock_or_flag:
                         faillock_with_policy = True
+                        faillock_policy_entries.append((pam_file, module_name, options))
         if faillock_lines:
             subitems[0]["details"].append("检测到登录失败处理模块")
             subitems[0]["details"].extend(faillock_lines)
@@ -2489,6 +3103,13 @@ class LinuxComplianceChecker:
 
         if faillock_lines and faillock_with_policy:
             subitems[1]["details"].append("pam_faillock/pam_tally2已配置限制参数")
+            for path, module, options in faillock_policy_entries:
+                if options:
+                    subitems[1]["details"].append(
+                        f"{path}: {module} -> {', '.join(options)}"
+                    )
+                else:
+                    subitems[1]["details"].append(f"{path}: {module} 已启用")
         elif faillock_lines:
             subitems[1]["status"] = "FAIL"
             subitems[1]["details"].append("检测到pam_faillock/pam_tally2但缺少deny或unlock_time参数")
@@ -2602,6 +3223,7 @@ class LinuxComplianceChecker:
 
         ssh_config = self.read_file('/etc/ssh/sshd_config')
         protocol_secure = False
+        observed_protocol_lines: List[str] = []
         if not ssh_config:
             subitems[0]["status"] = "FAIL"
             subitems[0]["details"].append("未找到SSH配置文件/etc/ssh/sshd_config")
@@ -2632,9 +3254,15 @@ class LinuxComplianceChecker:
                 subitems[0]["details"].append("SSH配置未明确限制为Protocol 2")
                 subitems[0]["recommendation"].append("请在sshd_config中声明Protocol 2以禁用SSHv1")
 
+            if protocol_lines:
+                observed_protocol_lines.extend(protocol_lines)
+
         running_insecure: List[str] = []
+        service_observations: List[str] = []
         for service in INSECURE_REMOTE_SERVICES:
-            rc, stdout, _ = self.run_command(f"systemctl is-active {service}")
+            rc, stdout, stderr = self.run_command(f"systemctl is-active {service}")
+            output = stdout or stderr or f"返回码 {rc}"
+            service_observations.append(f"{service}: {output}")
             if rc == 0 and stdout.strip() == 'active':
                 running_insecure.append(service)
         if running_insecure:
@@ -2643,6 +3271,15 @@ class LinuxComplianceChecker:
             subitems[0]["recommendation"].append("请禁用telnet/rsh等明文协议，仅保留SSH等加密方式")
         elif subitems[0]["status"] == "PASS":
             subitems[0]["details"].append("未检测到telnet/rlogin等不安全远程服务运行")
+
+        if observed_protocol_lines:
+            subitems[0]["details"].append(
+                "sshd_config中Protocol相关配置: " + "; ".join(observed_protocol_lines)
+            )
+        if service_observations:
+            subitems[0]["details"].append(
+                "systemctl is-active 检查结果: " + "; ".join(service_observations)
+            )
 
         self.finalize_item(item, subitems)
     def check_ces1_04_multi_factor_auth(self) -> None:
@@ -2680,6 +3317,7 @@ class LinuxComplianceChecker:
 
         has_password_module = False
         has_second_factor = False
+        password_evidence: List[str] = []
         second_factor_evidence: List[str] = []
 
         for pam_file in pam_files:
@@ -2690,11 +3328,22 @@ class LinuxComplianceChecker:
                 stripped = line.strip()
                 if not stripped or stripped.startswith('#') or not stripped.lower().startswith('auth'):
                     continue
-                if any(module in stripped for module in password_modules):
+                matched_password = sorted(
+                    {module for module in password_modules if module in stripped}
+                )
+                if matched_password:
                     has_password_module = True
-                if any(module in stripped for module in second_factor_modules):
+                    password_evidence.append(
+                        f"{pam_file}: {stripped} (匹配: {', '.join(matched_password)})"
+                    )
+                matched_second_factor = sorted(
+                    {module for module in second_factor_modules if module in stripped}
+                )
+                if matched_second_factor:
                     has_second_factor = True
-                    second_factor_evidence.append(f"{pam_file}: {stripped}")
+                    second_factor_evidence.append(
+                        f"{pam_file}: {stripped} (匹配: {', '.join(matched_second_factor)})"
+                    )
 
         if has_second_factor:
             subitems[0]["details"].append("检测到多因素鉴别模块配置")
@@ -2707,7 +3356,12 @@ class LinuxComplianceChecker:
             )
 
         if has_password_module:
-            subitems[1]["details"].append("已检测到pam_unix/pam_sss等密码认证模块")
+            subitems[1]["details"].append(
+                f"已检测到{len(password_evidence)}条密码认证模块配置"
+            )
+            if password_evidence:
+                subitems[1]["details"].append("密码认证配置明细:")
+                subitems[1]["details"].extend(password_evidence)
         else:
             subitems[1]["status"] = "FAIL"
             subitems[1]["details"].append("未检测到密码技术相关的PAM模块")
@@ -2722,12 +3376,14 @@ class LinuxComplianceChecker:
         ]
 
         login_users = self.get_login_users()
-        if login_users:
-            subitems[0]["details"].append(f"已发现{len(login_users)}个具备交互登录权限的账户")
-        else:
-            subitems[0]["details"].append("未发现具备交互登录权限的账户")
 
         groups = {g.gr_gid: g.gr_name for g in grp.getgrall()}
+        if login_users:
+            subitems[0]["details"].append(
+                f"已发现{len(login_users)}个具备交互登录权限的账户"
+            )
+        else:
+            subitems[0]["details"].append("未发现具备交互登录权限的账户")
         missing_groups: List[str] = []
         for user, entry in login_users.items():
             if entry.pw_gid not in groups:
@@ -2739,9 +3395,23 @@ class LinuxComplianceChecker:
         else:
             subitems[0]["details"].append("所有交互式账户均映射到有效的主组")
 
+        if login_users:
+            subitems[0]["details"].append("交互式账户详情 (/etc/passwd):")
+            for user, entry in sorted(login_users.items()):
+                group_name = groups.get(entry.pw_gid)
+                if group_name:
+                    group_display = f"{group_name} (GID={entry.pw_gid})"
+                else:
+                    group_display = f"GID={entry.pw_gid} (未找到组名)"
+                subitems[0]["details"].append(
+                    f"  - {user}: UID={entry.pw_uid}, 主组={group_display}, Shell={entry.pw_shell}, 家目录={entry.pw_dir}"
+                )
+
+        system_account_entries: List[pwd.struct_passwd] = []
         suspicious_accounts: List[str] = []
         for entry in pwd.getpwall():
             if entry.pw_uid < 1000 and entry.pw_name != 'root':
+                system_account_entries.append(entry)
                 if entry.pw_shell in INTERACTIVE_SHELLS:
                     suspicious_accounts.append(f"{entry.pw_name}({entry.pw_shell})")
         if suspicious_accounts:
@@ -2753,6 +3423,17 @@ class LinuxComplianceChecker:
         else:
             subitems[1]["details"].append("系统默认账户均已限制交互登录")
 
+        if system_account_entries:
+            subitems[1]["details"].append("默认账户Shell配置 (/etc/passwd):")
+            for entry in sorted(system_account_entries, key=lambda item: (item.pw_uid, item.pw_name)):
+                if entry.pw_shell in INTERACTIVE_SHELLS:
+                    shell_state = "允许交互登录"
+                else:
+                    shell_state = "已禁用交互登录"
+                subitems[1]["details"].append(
+                    f"  - {entry.pw_name}: UID={entry.pw_uid}, Shell={entry.pw_shell}（{shell_state}）"
+                )
+
         self.finalize_item(item, subitems)
     def check_ces1_06_default_account_management(self) -> None:
         item = "L3-CES1-06"
@@ -2761,13 +3442,28 @@ class LinuxComplianceChecker:
             self.make_subitem("2. 应核查是否已修改默认账户的默认口令"),
         ]
 
-        uid_zero_accounts = [entry.pw_name for entry in pwd.getpwall() if entry.pw_uid == 0]
-        if len(uid_zero_accounts) > 1:
+        groups = {entry.gr_gid: entry.gr_name for entry in grp.getgrall()}
+
+        uid_zero_entries = [entry for entry in pwd.getpwall() if entry.pw_uid == 0]
+        uid_zero_accounts = [entry.pw_name for entry in uid_zero_entries]
+        if len(uid_zero_entries) > 1:
             subitems[0]["status"] = "FAIL"
             subitems[0]["details"].append("检测到多个UID为0的账户: " + ", ".join(sorted(uid_zero_accounts)))
             subitems[0]["recommendation"].append("请确认仅保留root账户或重命名/删除多余的UID0账户")
         else:
             subitems[0]["details"].append("仅存在一个UID为0的账户")
+
+        if uid_zero_entries:
+            subitems[0]["details"].append("UID 0 账户详情 (/etc/passwd):")
+            for entry in sorted(uid_zero_entries, key=lambda item: item.pw_name):
+                group_name = groups.get(entry.pw_gid)
+                if group_name:
+                    group_display = f"{group_name} (GID={entry.pw_gid})"
+                else:
+                    group_display = f"GID={entry.pw_gid}"
+                subitems[0]["details"].append(
+                    f"  - {entry.pw_name}: Shell={entry.pw_shell or '(未配置)'}, 主组={group_display}, 家目录={entry.pw_dir}, 描述={entry.pw_gecos or '(空)'}"
+                )
 
         default_candidates = [
             'admin',
@@ -2782,25 +3478,47 @@ class LinuxComplianceChecker:
         insecure_defaults: List[str] = []
         locked_defaults: List[str] = []
         unknown_defaults: List[str] = []
+        missing_defaults: List[str] = []
+        default_account_details: List[str] = []
 
         for candidate in default_candidates:
             try:
                 entry = pwd.getpwnam(candidate)
             except KeyError:
+                missing_defaults.append(candidate)
                 continue
-            shell = entry.pw_shell
+            raw_shell = entry.pw_shell or ""
+            shell = raw_shell or "(未配置)"
+            group_name = groups.get(entry.pw_gid)
+            if group_name:
+                group_display = f"{group_name} (GID={entry.pw_gid})"
+            else:
+                group_display = f"GID={entry.pw_gid}"
+            passwd_summary = (
+                f"UID={entry.pw_uid}, 主组={group_display}, Shell={shell}, 家目录={entry.pw_dir}"
+            )
             try:
                 shadow = spwd.getspnam(candidate)
                 password_field = shadow.sp_pwd
             except PermissionError as exc:
                 unknown_defaults.append(f"{candidate}(无法读取shadow: {exc})")
+                default_account_details.append(
+                    f"  - {candidate}: {passwd_summary}, 口令状态=无法读取shadow: {exc}"
+                )
                 continue
             except KeyError:
                 unknown_defaults.append(f"{candidate}(shadow记录缺失)")
+                default_account_details.append(
+                    f"  - {candidate}: {passwd_summary}, 口令状态=shadow记录缺失"
+                )
                 continue
 
+            password_desc = self.describe_password_hash(password_field)
+            default_account_details.append(
+                f"  - {candidate}: {passwd_summary}, 口令状态={password_desc}"
+            )
             locked = password_field in ('', '!', '*', '!!')
-            if shell in NOLOGIN_SHELLS or locked:
+            if raw_shell in NOLOGIN_SHELLS or locked:
                 locked_defaults.append(candidate)
             else:
                 insecure_defaults.append(candidate)
@@ -2815,6 +3533,11 @@ class LinuxComplianceChecker:
             subitems[1]["status"] = "ERROR"
             subitems[1]["details"].extend(unknown_defaults)
             subitems[1]["recommendation"].append("请人工核查默认账户口令状态")
+        if default_account_details:
+            subitems[1]["details"].append("默认账户检查详情 (/etc/passwd + /etc/shadow):")
+            subitems[1]["details"].extend(default_account_details)
+        if missing_defaults:
+            subitems[1]["details"].append("以下默认账户未在系统中找到: " + ", ".join(sorted(missing_defaults)))
         if not insecure_defaults and not locked_defaults and not unknown_defaults:
             subitems[1]["details"].append("未发现启用状态的常见默认账户")
 
@@ -2827,24 +3550,42 @@ class LinuxComplianceChecker:
         ]
 
         login_users = self.get_login_users()
+        per_user_shadow_info: Dict[str, Dict[str, object]] = {}
         uid_map: Dict[int, List[str]] = {}
         for entry in login_users.values():
             uid_map.setdefault(entry.pw_uid, []).append(entry.pw_name)
         shared_accounts = {uid: names for uid, names in uid_map.items() if len(names) > 1}
         if shared_accounts:
-            details = ", ".join(f"UID {uid}: {', '.join(sorted(names))}" for uid, names in shared_accounts.items())
+            details = ", ".join(
+                f"UID {uid}: {', '.join(sorted(names))}" for uid, names in shared_accounts.items()
+            )
             subitems[0]["status"] = "FAIL"
             subitems[0]["details"].append("检测到共享账户: " + details)
             subitems[0]["recommendation"].append("请确保管理员账户实行一人一号，避免共享UID")
         else:
             subitems[0]["details"].append("未检测到共享UID的账户")
 
+        if login_users:
+            subitems[0]["details"].append("交互式账户清单及属性:")
+            for username in sorted(login_users):
+                entry = login_users[username]
+                group_name = self.resolve_group_name(entry.pw_gid)
+                subitems[0]["details"].append(
+                    " - "
+                    + f"{username}: UID {entry.pw_uid}, 主组 {group_name} (GID {entry.pw_gid}), 家目录 {entry.pw_dir}, Shell {entry.pw_shell}"
+                )
+            subitems[0]["details"].append(
+                f"共计 {len(login_users)} 个交互式账户参与核查"
+            )
+        else:
+            subitems[0]["details"].append("未检测到具备交互登录权限的账户")
+
         shadow_content = self.read_file('/etc/shadow')
         if shadow_content:
             now_days = self.days_since_epoch()
-            expired_accounts: List[str] = []
-            stale_accounts: List[str] = []
-            locked_accounts: List[str] = []
+            expired_accounts: Set[str] = set()
+            stale_accounts: Set[str] = set()
+            locked_accounts: Set[str] = set()
             for line in shadow_content.splitlines():
                 if not line or ':' not in line:
                     continue
@@ -2852,39 +3593,113 @@ class LinuxComplianceChecker:
                 username = fields[0]
                 if username not in login_users:
                     continue
+                info = per_user_shadow_info.setdefault(username, {})
+                flags_list = info.setdefault("flags", [])
                 expire_field = fields[7] if len(fields) > 7 else ''
                 last_change = fields[2] if len(fields) > 2 else ''
                 password_hash = fields[1] if len(fields) > 1 else ''
-                try:
-                    if expire_field:
-                        expire_value = int(expire_field)
-                        if 0 < expire_value < now_days:
-                            expired_accounts.append(username)
-                except ValueError:
-                    expired_accounts.append(username)
-                try:
-                    if last_change:
+                info["password_summary"] = self.describe_password_hash(password_hash)
+                stripped_hash = password_hash or ""
+                locked_flag = False
+                if stripped_hash == "" or stripped_hash in {'!', '*', '!!'} or stripped_hash.startswith('!'):
+                    locked_flag = True
+                    locked_accounts.add(username)
+                info["locked"] = locked_flag
+
+                last_change_value: Optional[int] = None
+                if last_change:
+                    try:
                         last_change_value = int(last_change)
-                        if 0 < last_change_value and now_days - last_change_value > 365:
-                            stale_accounts.append(username)
-                except ValueError:
-                    continue
-                if password_hash in ('!', '*', '!!'):
-                    locked_accounts.append(username)
+                    except ValueError:
+                        message = f"最后改密字段无法解析({last_change})"
+                        if message not in flags_list:
+                            flags_list.append(message)
+                info["last_change_int"] = last_change_value
+                if last_change_value and last_change_value > 0:
+                    info["last_change_desc"] = self.describe_shadow_change(last_change_value, now_days)
+                    days_since_change = max(0, now_days - last_change_value)
+                    info["days_since_change"] = days_since_change
+                    if days_since_change > 365:
+                        stale_accounts.add(username)
+                        message = f"距今 {days_since_change} 天未改密"
+                        if message not in flags_list:
+                            flags_list.append(message)
+                else:
+                    if not last_change:
+                        if "缺少最后改密日期" not in flags_list:
+                            flags_list.append("缺少最后改密日期")
+
+                expire_value: Optional[int] = None
+                if expire_field:
+                    try:
+                        expire_value = int(expire_field)
+                    except ValueError:
+                        message = f"口令到期字段无法解析({expire_field})"
+                        if message not in flags_list:
+                            flags_list.append(message)
+                info["expire_int"] = expire_value
+                if expire_value and expire_value > 0:
+                    info["expire_desc"] = self.describe_shadow_expiry(expire_value, now_days)
+                    delta = expire_value - now_days
+                    info["days_until_expire"] = delta
+                    if delta < 0:
+                        expired_accounts.add(username)
+                        message = f"口令已过期 {-delta} 天"
+                        if message not in flags_list:
+                            flags_list.append(message)
+                elif expire_field:
+                    message = f"口令到期字段值={expire_field}"
+                    if message not in flags_list:
+                        flags_list.append(message)
+
+            for username in login_users:
+                per_user_shadow_info.setdefault(username, {})
+
             if expired_accounts:
                 subitems[0]["status"] = "FAIL"
-                subitems[0]["details"].append("以下账户已过期: " + ", ".join(sorted(set(expired_accounts))))
+                subitems[0]["details"].append("以下账户已过期:")
+                for username in sorted(expired_accounts):
+                    entry = login_users.get(username)
+                    info = per_user_shadow_info.get(username, {})
+                    subitems[0]["details"].append(
+                        f" - {self.describe_account_overview(username, entry, info, now_days)}"
+                    )
                 subitems[0]["recommendation"].append("请清理或禁用上述过期账户")
+
             if stale_accounts:
                 subitems[1]["status"] = "FAIL"
-                subitems[1]["details"].append(
-                    "以下账户超过一年未更改口令，需确认是否仍在使用: " + ", ".join(sorted(set(stale_accounts)))
-                )
+                subitems[1]["details"].append("以下账户超过一年未更改口令，需确认是否仍在使用:")
+                for username in sorted(stale_accounts):
+                    entry = login_users.get(username)
+                    info = per_user_shadow_info.get(username, {})
+                    subitems[1]["details"].append(
+                        f" - {self.describe_account_overview(username, entry, info, now_days)}"
+                    )
                 subitems[1]["recommendation"].append("请核实并停用长期未使用的账户")
+
             if locked_accounts:
-                subitems[1]["details"].append("已锁定的账户: " + ", ".join(sorted(set(locked_accounts))))
+                subitems[1]["details"].append("已锁定的账户:")
+                for username in sorted(locked_accounts):
+                    entry = login_users.get(username)
+                    info = per_user_shadow_info.get(username, {})
+                    subitems[1]["details"].append(
+                        f" - {self.describe_account_overview(username, entry, info, now_days)}"
+                    )
+
             if not expired_accounts and not stale_accounts:
-                subitems[1]["details"].append("未发现过期或长期未使用的账户")
+                if login_users:
+                    subitems[1]["details"].append("未发现过期或长期未使用的账户，已核查以下口令状态:")
+                    for username in sorted(login_users):
+                        entry = login_users.get(username)
+                        info = per_user_shadow_info.get(username, {})
+                        subitems[1]["details"].append(
+                            f" - {self.describe_account_overview(username, entry, info, now_days)}"
+                        )
+                    subitems[1]["details"].append(
+                        f"共核查 {len(login_users)} 个账户"
+                    )
+                else:
+                    subitems[1]["details"].append("未发现过期或长期未使用的账户")
         else:
             subitems[0]["status"] = "ERROR"
             subitems[0]["details"].append("无法读取/etc/shadow，无法评估账户有效期")
@@ -2951,13 +3766,21 @@ class LinuxComplianceChecker:
 
         try:
             sudoers_stat = os.stat('/etc/sudoers')
-            permissions = oct(sudoers_stat.st_mode)[-3:]
-            if permissions != '440':
+            permissions = stat.S_IMODE(sudoers_stat.st_mode)
+            permissions_str = format(permissions, "03o")
+            if permissions_str != '440':
                 subitems[2]["status"] = "FAIL"
-                subitems[2]["details"].append(f"/etc/sudoers权限为{permissions}")
+                subitems[2]["details"].append(f"/etc/sudoers权限为{permissions_str}")
                 subitems[2]["recommendation"].append("请将/etc/sudoers权限设置为440以防止未授权修改")
             else:
-                subitems[2]["details"].append("/etc/sudoers权限符合440要求")
+                owner = self.safe_getpwuid(sudoers_stat.st_uid)
+                group = self.safe_getgrgid(sudoers_stat.st_gid)
+                size = sudoers_stat.st_size
+                mtime = datetime.fromtimestamp(sudoers_stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+                subitems[2]["details"].append(
+                    "/etc/sudoers权限符合440要求，具体信息: "
+                    f"权限={permissions_str}, 所有者={owner}, 所属组={group}, 大小={size}字节, 修改时间={mtime}"
+                )
         except FileNotFoundError:
             subitems[2]["status"] = "FAIL"
             subitems[2]["details"].append("未找到/etc/sudoers文件")
@@ -2973,47 +3796,176 @@ class LinuxComplianceChecker:
 
         selinux_enabled = False
         selinux_enforcing = False
+        selinux_mode_summary = ""
+        selinux_fields: Dict[str, str] = {}
         rc, stdout, stderr = self.run_command('sestatus')
         if rc == 0:
-            if 'SELinux status: enabled' in stdout:
+            selinux_fields = self.parse_colon_key_values(stdout)
+            status_value = selinux_fields.get("SELinux status", "").lower()
+            current_mode = selinux_fields.get("Current mode", "")
+            config_mode = selinux_fields.get("Mode from config file", "")
+            if status_value == 'enabled':
                 selinux_enabled = True
                 subitems[0]["details"].append("检测到SELinux已启用")
-                mode_match = re.search(r"Current mode:\s+(\w+)", stdout)
-                if mode_match and mode_match.group(1).lower() == 'enforcing':
+            else:
+                subitems[0]["status"] = "FAIL"
+                subitems[0]["details"].append(
+                    f"SELinux状态为: {selinux_fields.get('SELinux status', '未知')}"
+                )
+                subitems[0]["recommendation"].append("请启用SELinux并配置安全标记")
+
+            relevant_keys = []
+            for key in (
+                "SELinux status",
+                "Current mode",
+                "Mode from config file",
+                "Policy from config file",
+            ):
+                value = selinux_fields.get(key)
+                if value:
+                    relevant_keys.append(f"{key}: {value}")
+            if relevant_keys:
+                subitems[0]["details"].append(
+                    "sestatus关键字段: " + "; ".join(relevant_keys)
+                )
+
+            if current_mode:
+                selinux_mode_summary = f"SELinux当前模式: {current_mode}"
+                if current_mode.lower() == 'enforcing':
                     selinux_enforcing = True
                     subitems[1]["details"].append("SELinux处于Enforcing模式")
                 else:
                     subitems[1]["status"] = "FAIL"
-                    subitems[1]["details"].append("SELinux未处于Enforcing模式")
-                    subitems[1]["recommendation"].append("请启用SELinux enforcing模式以落实强制访问控制")
+                    subitems[1]["details"].append(
+                        f"SELinux当前模式为{current_mode}"
+                    )
+                    if config_mode:
+                        subitems[1]["details"].append(
+                            f"配置文件中的模式为{config_mode}"
+                        )
+                    subitems[1]["recommendation"].append(
+                        "请启用SELinux enforcing模式以落实强制访问控制"
+                    )
             else:
-                subitems[0]["status"] = "FAIL"
-                subitems[0]["details"].append("SELinux未启用")
-                subitems[0]["recommendation"].append("请启用SELinux并配置安全标记")
+                subitems[1]["status"] = "FAIL"
+                status_label = selinux_fields.get('SELinux status') or '未知'
+                subitems[1]["details"].append(
+                    f"SELinux当前模式不可用（状态: {status_label})"
+                )
+                if config_mode:
+                    subitems[1]["details"].append(
+                        f"配置文件中的模式为{config_mode}"
+                    )
+                subitems[1]["recommendation"].append(
+                    "请启用SELinux enforcing模式以落实强制访问控制"
+                )
         else:
-            if rc == -1 and stderr and 'not found' in stderr.lower():
+            error_text = (stderr or "").strip()
+            lowered = error_text.lower()
+            if rc == -1 or "not found" in lowered or "未找到" in lowered:
                 subitems[0]["details"].append("未检测到sestatus命令，可能未安装SELinux组件")
+            elif error_text:
+                subitems[0]["details"].append(
+                    f"sestatus命令返回错误: {error_text}"
+                )
             else:
-                subitems[0]["details"].append("sestatus命令执行失败，无法确认SELinux状态")
+                subitems[0]["details"].append("sestatus命令执行未返回结果")
+
+        selinux_config_path = '/etc/selinux/config'
+        selinux_config = self.read_file(selinux_config_path)
+        if selinux_config:
+            config_lines: List[str] = []
+            for raw_line in selinux_config.splitlines():
+                stripped = raw_line.strip()
+                if stripped.startswith('SELINUX='):
+                    config_lines.append(stripped)
+            if config_lines:
+                subitems[0]["details"].append(
+                    f"{selinux_config_path}设置: {', '.join(config_lines)}"
+                )
+        elif selinux_config is None:
+            subitems[0]["details"].append(
+                f"无法读取{selinux_config_path}，可能不存在或权限不足"
+            )
 
         apparmor_available = False
         apparmor_enforcing = False
+        apparmor_summary: List[str] = []
         rc, stdout, stderr = self.run_command('aa-status')
         if rc == 0:
             apparmor_available = True
             subitems[0]["details"].append("检测到AppArmor配置")
-            if 'profiles are in enforce mode' in stdout:
+            for line in stdout.splitlines():
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                if 'profiles are in enforce mode' in stripped or 'profiles are in complain mode' in stripped:
+                    apparmor_summary.append(stripped)
+                if stripped.startswith('Enforced:') or stripped.startswith('Disabled:'):
+                    apparmor_summary.append(stripped)
+            if apparmor_summary:
+                subitems[0]["details"].append(
+                    "aa-status关键字段: " + "; ".join(apparmor_summary)
+                )
+            if any('profiles are in enforce mode' in entry and not entry.startswith('0') for entry in apparmor_summary):
                 apparmor_enforcing = True
-                subitems[1]["details"].append("AppArmor处于enforce模式")
-            else:
+                subitems[1]["details"].append("AppArmor存在enforce模式的策略")
+            elif 'profiles are in enforce mode' in stdout:
+                match = re.search(r"(\d+) profiles are in enforce mode", stdout)
+                if match and match.group(1) != '0':
+                    apparmor_enforcing = True
+                    subitems[1]["details"].append(
+                        f"AppArmor enforce模式的策略数量: {match.group(1)}"
+                    )
+            if not apparmor_enforcing:
                 subitems[0]["status"] = "FAIL"
                 subitems[0]["details"].append("AppArmor未处于强制模式")
-                subitems[0]["recommendation"].append("请将AppArmor配置为enforce模式以提供安全标记")
+                subitems[0]["recommendation"].append(
+                    "请将AppArmor配置为enforce模式以提供安全标记"
+                )
         else:
-            if rc == -1 and stderr and 'not found' in stderr.lower():
-                subitems[0]["details"].append("未检测到aa-status命令，系统可能未启用AppArmor")
+            error_text = (stderr or "").strip()
+            lowered = error_text.lower()
+            if rc == -1 or "not found" in lowered or "未找到" in lowered:
+                subitems[0]["details"].append("未检测到aa-status命令，系统可能未安装AppArmor")
+            elif error_text:
+                subitems[0]["details"].append(
+                    f"aa-status返回错误信息: {error_text}"
+                )
             else:
-                subitems[0]["details"].append("aa-status命令执行失败，无法确认AppArmor状态")
+                subitems[0]["details"].append("aa-status未返回任何输出")
+
+        if shutil.which('systemctl') is not None:
+            rc, stdout, stderr = self.run_command('systemctl is-enabled apparmor')
+            if rc == 0 and stdout:
+                subitems[0]["details"].append(
+                    f"systemctl is-enabled apparmor: {stdout.strip()}"
+                )
+            elif stderr:
+                lowered = stderr.lower()
+                if "no such file" in lowered or "not found" in lowered:
+                    subitems[0]["details"].append(
+                        "AppArmor systemd单元不存在（systemctl is-enabled apparmor）"
+                    )
+                else:
+                    subitems[0]["details"].append(
+                        f"systemctl is-enabled apparmor 输出: {stderr.strip()}"
+                    )
+            rc, stdout, stderr = self.run_command('systemctl is-active apparmor')
+            if rc == 0 and stdout:
+                subitems[0]["details"].append(
+                    f"systemctl is-active apparmor: {stdout.strip()}"
+                )
+            elif stderr:
+                lowered = stderr.lower()
+                if "no such file" in lowered or "not found" in lowered:
+                    subitems[0]["details"].append(
+                        "AppArmor systemd单元不存在（systemctl is-active apparmor）"
+                    )
+                else:
+                    subitems[0]["details"].append(
+                        f"systemctl is-active apparmor 输出: {stderr.strip()}"
+                    )
 
         if not selinux_enabled and not apparmor_available:
             subitems[0]["status"] = "FAIL"
@@ -3024,6 +3976,16 @@ class LinuxComplianceChecker:
             subitems[1]["status"] = "FAIL"
             if not subitems[1]["details"]:
                 subitems[1]["details"].append("未发现强制访问控制策略处于执行状态")
+            else:
+                enforcement_context: List[str] = []
+                if selinux_mode_summary:
+                    enforcement_context.append(selinux_mode_summary)
+                if apparmor_summary:
+                    enforcement_context.append(
+                        "AppArmor摘要: " + "; ".join(apparmor_summary)
+                    )
+                if enforcement_context:
+                    subitems[1]["details"].extend(enforcement_context)
             subitems[1]["recommendation"].append("请启用SELinux或AppArmor的强制模式以落实安全标记访问控制")
 
         self.finalize_item(item, subitems)
@@ -3035,10 +3997,30 @@ class LinuxComplianceChecker:
             self.make_subitem("3. 应核查是否对重要的用户行为和重要安全事件进行审计"),
         ]
 
-        rc, stdout, _ = self.run_command('systemctl is-active auditd')
-        auditd_active = rc == 0 and stdout.strip() == 'active'
-        rc, stdout, _ = self.run_command('systemctl is-active rsyslog')
-        rsyslog_active = rc == 0 and stdout.strip() == 'active'
+        rc, stdout, stderr = self.run_command('systemctl is-active auditd')
+        auditd_status = stdout.strip()
+        if auditd_status:
+            subitems[0]["details"].append(
+                f"systemctl is-active auditd: {auditd_status}"
+            )
+        elif stderr:
+            subitems[0]["details"].append(
+                f"systemctl is-active auditd 错误: {stderr}"
+            )
+        auditd_active = rc == 0 and auditd_status == 'active'
+
+        rc, stdout, stderr = self.run_command('systemctl is-active rsyslog')
+        rsyslog_status = stdout.strip()
+        if rsyslog_status:
+            subitems[0]["details"].append(
+                f"systemctl is-active rsyslog: {rsyslog_status}"
+            )
+        elif stderr:
+            subitems[0]["details"].append(
+                f"systemctl is-active rsyslog 错误: {stderr}"
+            )
+        rsyslog_active = rc == 0 and rsyslog_status == 'active'
+
         if auditd_active:
             subitems[0]["details"].append("auditd服务正在运行")
         else:
@@ -3052,17 +4034,64 @@ class LinuxComplianceChecker:
             subitems[0]["details"].append("rsyslog服务未运行")
             subitems[0]["recommendation"].append("请启用系统日志服务(rsyslog或syslog-ng)")
 
-        rc, stdout, _ = self.run_command('auditctl -l')
-        if rc == 0 and stdout:
-            rules = stdout.splitlines()
-            subitems[1]["details"].append("检测到已加载的审计规则")
-            subitems[1]["details"].append(rules[0])
-            if len(rules) > 1:
-                subitems[1]["details"].append(f"...共{len(rules)}条规则")
+        if shutil.which('systemctl') is not None:
+            rc, stdout, stderr = self.run_command('systemctl is-enabled auditd')
+            if stdout:
+                subitems[0]["details"].append(
+                    f"systemctl is-enabled auditd: {stdout.strip()}"
+                )
+            elif stderr:
+                subitems[0]["details"].append(
+                    f"systemctl is-enabled auditd 错误: {stderr}"
+                )
+
+            rc, stdout, stderr = self.run_command('systemctl is-enabled rsyslog')
+            if stdout:
+                subitems[0]["details"].append(
+                    f"systemctl is-enabled rsyslog: {stdout.strip()}"
+                )
+            elif stderr:
+                subitems[0]["details"].append(
+                    f"systemctl is-enabled rsyslog 错误: {stderr}"
+                )
+
+        rc, stdout, stderr = self.run_command('auditctl -l')
+        if rc == 0:
+            raw_lines = [line.strip() for line in stdout.splitlines() if line.strip()]
+            meaningful_rules = [
+                line for line in raw_lines if line.lower() != 'no rules'
+            ]
+
+            if meaningful_rules:
+                subitems[1]["details"].append("检测到已加载的审计规则")
+                for rule in meaningful_rules[:5]:
+                    subitems[1]["details"].append(f"auditctl规则: {rule}")
+                if len(meaningful_rules) > 5:
+                    subitems[1]["details"].append(
+                        f"...共{len(meaningful_rules)}条规则"
+                    )
+            else:
+                subitems[1]["status"] = "FAIL"
+                if raw_lines:
+                    subitems[1]["details"].append(
+                        "auditctl -l 输出: " + "; ".join(raw_lines)
+                    )
+                else:
+                    subitems[1]["details"].append("未发现已加载的审计规则")
+                subitems[1]["recommendation"].append(
+                    "请配置/etc/audit/rules.d/*.rules确保覆盖所有用户活动"
+                )
         else:
             subitems[1]["status"] = "FAIL"
-            subitems[1]["details"].append("未发现已加载的审计规则")
-            subitems[1]["recommendation"].append("请配置/etc/audit/rules.d/*.rules确保覆盖所有用户活动")
+            if stdout:
+                subitems[1]["details"].append(f"auditctl -l 输出: {stdout}")
+            if stderr:
+                subitems[1]["details"].append(f"auditctl -l 错误: {stderr}")
+            if not stdout and not stderr:
+                subitems[1]["details"].append("未发现已加载的审计规则")
+            subitems[1]["recommendation"].append(
+                "请配置/etc/audit/rules.d/*.rules确保覆盖所有用户活动"
+            )
 
         audit_log_paths = [
             '/var/log/audit/audit.log',
@@ -3146,34 +4175,102 @@ class LinuxComplianceChecker:
             '/var/log/syslog',
         ]
         permission_issues: List[str] = []
+        reviewed_logs: List[str] = []
+        missing_logs: List[str] = []
         for log in log_files:
             if not os.path.exists(log):
+                missing_logs.append(log)
                 continue
             try:
-                mode = oct(os.stat(log).st_mode)[-3:]
-                if int(mode, 8) & 0o007:
-                    permission_issues.append(f"{log} 权限为{mode}")
+                stat_result = os.stat(log)
             except OSError as exc:
                 permission_issues.append(f"无法获取{log}权限: {exc}")
+                continue
+
+            mode = stat.S_IMODE(stat_result.st_mode)
+            owner = self.safe_getpwuid(stat_result.st_uid)
+            group = self.safe_getgrgid(stat_result.st_gid)
+            size = stat_result.st_size
+            mtime = datetime.fromtimestamp(stat_result.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+            detail = (
+                f"{log}: 权限={mode:03o}, 所有者={owner}, 组={group}, 大小={size}B, 修改时间={mtime}"
+            )
+            reviewed_logs.append(detail)
+
+            if mode & 0o007:
+                permission_issues.append(f"{detail} (包含other权限)")
+            elif mode & 0o020:
+                permission_issues.append(f"{detail} (组具有写权限)")
+
+        if reviewed_logs:
+            subitems[0]["details"].append("审计日志文件权限核查结果:")
+            subitems[0]["details"].extend(reviewed_logs)
+        if missing_logs:
+            joined_missing = ", ".join(missing_logs)
+            subitems[0]["details"].append(
+                "发行版特定日志在本系统中未提供（已跳过）：" + joined_missing
+            )
+
         if permission_issues:
             subitems[0]["status"] = "FAIL"
-            subitems[0]["details"].append("以下日志权限过于宽松:")
+            subitems[0]["details"].append("存在权限过宽的日志文件:")
             subitems[0]["details"].extend(permission_issues)
             subitems[0]["recommendation"].append("请将重要日志权限设置为640或更严格，并限制其他用户访问")
-        else:
-            subitems[0]["details"].append("审计日志权限设置符合要求")
+        elif reviewed_logs:
+            subitems[0]["details"].append("所有已找到的审计日志文件权限均满足最小化要求")
 
-        logrotate_conf = self.read_file('/etc/logrotate.conf')
-        if logrotate_conf and re.search(r"rotate\s+\d+", logrotate_conf):
-            subitems[1]["details"].append("已检测到日志轮转配置")
-            if 'compress' not in logrotate_conf:
-                subitems[1]["status"] = "FAIL"
-                subitems[1]["details"].append("日志轮转未启用压缩")
-                subitems[1]["recommendation"].append("建议启用日志压缩并结合离线备份")
-        else:
+        logrotate_sources: List[str] = ['/etc/logrotate.conf']
+        logrotate_dir = '/etc/logrotate.d'
+        if os.path.isdir(logrotate_dir):
+            for entry in sorted(os.listdir(logrotate_dir)):
+                logrotate_sources.append(os.path.join(logrotate_dir, entry))
+
+        rotate_detected = False
+        compress_detected = False
+        readable_configs = False
+        for config_path in logrotate_sources:
+            content = self.read_file(config_path)
+            if content is None:
+                subitems[1]["details"].append(f"未能读取{config_path}")
+                continue
+
+            readable_configs = True
+            rotate_matches = sorted(set(re.findall(r"rotate\s+\d+", content)))
+            frequency_matches = sorted(
+                set(re.findall(r"\b(hourly|daily|weekly|monthly|yearly)\b", content))
+            )
+            compress_present = bool(re.search(r"^\s*compress\b", content, re.MULTILINE))
+            detail_parts: List[str] = []
+            if rotate_matches:
+                rotate_detected = True
+                detail_parts.append("轮转保留设置=" + ", ".join(rotate_matches))
+            else:
+                detail_parts.append("未显式声明rotate保留设置（可能继承全局策略）")
+            if frequency_matches:
+                detail_parts.append("执行频率=" + "/".join(frequency_matches))
+            else:
+                detail_parts.append("未指定轮转频率")
+            if compress_present:
+                compress_detected = True
+                detail_parts.append("启用compress")
+            else:
+                detail_parts.append("未启用compress")
+
+            subitems[1]["details"].append(f"{config_path}: " + "; ".join(detail_parts))
+
+        if not rotate_detected:
             subitems[1]["status"] = "FAIL"
-            subitems[1]["details"].append("未找到日志轮转配置")
+            if readable_configs:
+                subitems[1]["details"].append("未在已读取的配置中找到rotate参数")
+            else:
+                subitems[1]["details"].append("未读取到任何日志轮转配置文件")
             subitems[1]["recommendation"].append("请配置/etc/logrotate.conf或/etc/logrotate.d/确保日志定期归档")
+        elif not compress_detected:
+            subitems[1]["status"] = "FAIL"
+            subitems[1]["details"].append("已配置轮转但未启用日志压缩")
+            subitems[1]["recommendation"].append("建议在日志轮转策略中启用compress并结合离线备份")
+        else:
+            subitems[1]["details"].append("日志轮转配置包含保留策略并已启用压缩归档")
 
         self.finalize_item(item, subitems)
     def check_ces1_17_minimal_installation(self) -> None:
@@ -3184,42 +4281,98 @@ class LinuxComplianceChecker:
         ]
 
         unwanted_packages = [
-            'telnet',
-            'telnetd',
-            'rsh',
-            'rsh-server',
-            'ypbind',
-            'ypserv',
-            'xinetd',
-            'tftp',
-            'vsftpd',
-            'samba',
-            'cifs-utils',
-            'xorg-x11-server-Xorg',
+            "telnet",
+            "telnetd",
+            "rsh",
+            "rsh-server",
+            "ypbind",
+            "ypserv",
+            "xinetd",
+            "tftp",
+            "vsftpd",
+            "samba",
+            "cifs-utils",
+            "xorg-x11-server-Xorg",
         ]
 
-        package_manager_detected = False
+        manager = self.package_manager or self.detect_package_manager()
+        package_manager_detected = manager is not None
+        if manager:
+            self.package_manager = manager
+            subitems[0]["details"].append(
+                f"检测到包管理器: {manager}"
+            )
+            distribution = self.os_info.get("distribution")
+            if distribution:
+                subitems[0]["details"].append(
+                    f"目标操作系统: {distribution}"
+                )
+
+        package_states: List[Tuple[str, bool]] = []
         detected_packages: List[str] = []
         for package in unwanted_packages:
             installed = self.is_package_installed(package)
-            if installed is not None:
-                package_manager_detected = True
+            if installed is None:
+                continue
+            package_manager_detected = True
+            package_states.append((package, installed))
             if installed:
                 detected_packages.append(package)
+
+        if package_states:
+            formatted_states: List[str] = []
+            for package, installed in package_states:
+                if installed:
+                    description = self.describe_package_installation(package)
+                    if description and description != package:
+                        formatted_states.append(f"{package}: 已安装 ({description})")
+                    else:
+                        formatted_states.append(f"{package}: 已安装")
+                else:
+                    formatted_states.append(f"{package}: 未安装")
+            subitems[0]["details"].append(
+                "核查组件状态: " + "; ".join(formatted_states)
+            )
+
         if package_manager_detected:
             subitems[0]["details"].append("已通过包管理器核查最小化安装状态")
         else:
             subitems[0]["status"] = "ERROR"
-            subitems[0]["details"].append("无法确定包管理器状态，请人工确认最小安装原则执行情况")
+            subitems[0]["details"].append(
+                "无法确定包管理器状态，请人工确认最小安装原则执行情况"
+            )
 
         if detected_packages:
+            installed_details: List[str] = []
+            for package in sorted(set(detected_packages)):
+                description = self.describe_package_installation(package)
+                installed_details.append(description or package)
             subitems[1]["status"] = "FAIL"
-            subitems[1]["details"].append("检测到可能非必要的组件: " + ", ".join(sorted(detected_packages)))
+            subitems[1]["details"].append(
+                "检测到可能非必要的组件 (含版本信息): "
+                + "; ".join(installed_details)
+            )
             subitems[1]["recommendation"].append("请根据系统角色评估并卸载非必要组件")
+        elif package_manager_detected and package_states:
+            absent_components = [
+                package for package, installed in package_states if not installed
+            ]
+            if absent_components:
+                subitems[1]["details"].append(
+                    "已确认以下常见组件未安装: "
+                    + ", ".join(sorted(absent_components))
+                )
+            subitems[1]["details"].append(
+                "未检测到常见的非必要组件，符合最小化安装原则"
+            )
         elif package_manager_detected:
-            subitems[1]["details"].append("未检测到常见的非必要组件，符合最小化安装原则")
+            subitems[1]["details"].append(
+                "未检测到常见的非必要组件，符合最小化安装原则"
+            )
         else:
-            subitems[1]["details"].append("未能识别包管理器，需人工核查已安装组件")
+            subitems[1]["details"].append(
+                "未能识别包管理器，需人工核查已安装组件"
+            )
 
         self.finalize_item(item, subitems)
     def check_ces1_18_service_port_control(self) -> None:
@@ -3230,46 +4383,258 @@ class LinuxComplianceChecker:
         ]
 
         running_services: List[str] = []
-        rc, stdout, _ = self.run_command(
+        running_service_details: List[str] = []
+        service_listing_source = ""
+        service_listing_note: Optional[str] = None
+        service_errors: List[str] = []
+
+        def record_service_error(command: str, stderr_output: str) -> None:
+            message = stderr_output.strip() if stderr_output else "命令无输出"
+            service_errors.append(f"{command}: {message}")
+
+        systemctl_command = (
             'systemctl list-units --type=service --state=running --no-legend'
         )
-        if rc == 0:
-            for line in stdout.splitlines():
-                service_name = line.split()[0]
+        rc, stdout, stderr = self.run_command(systemctl_command)
+        if rc == 0 and stdout:
+            service_listing_source = systemctl_command
+            for raw_line in stdout.splitlines():
+                line = raw_line.strip()
+                if not line:
+                    continue
+                parts = line.split(None, 4)
+                service_name = parts[0]
+                description = parts[4] if len(parts) > 4 else ''
+                display = service_name
+                if description:
+                    display = f"{service_name} - {description}"
+                running_service_details.append(display)
                 if service_name.endswith('.service'):
                     base = service_name[:-8]
-                    if base in UNNECESSARY_SERVICES:
-                        running_services.append(base)
+                else:
+                    base = service_name
+                if base in UNNECESSARY_SERVICES:
+                    running_services.append(base)
+        else:
+            record_service_error(systemctl_command, stderr)
+
+        if not running_service_details:
+            service_command = 'service --status-all'
+            rc, stdout, stderr = self.run_command(service_command)
+            if rc == 0 and stdout:
+                service_listing_source = service_command
+                found_running = False
+                for raw_line in stdout.splitlines():
+                    stripped = raw_line.strip()
+                    if not stripped or not stripped.startswith('['):
+                        continue
+                    parts = stripped.split(']', 1)
+                    if len(parts) != 2:
+                        continue
+                    status_token = parts[0]
+                    name = parts[1].strip()
+                    if not name:
+                        continue
+                    if '+' in status_token:
+                        found_running = True
+                        running_service_details.append(name)
+                        base = name[:-8] if name.endswith('.service') else name
+                        if base in UNNECESSARY_SERVICES:
+                            running_services.append(base)
+                if not found_running:
+                    service_listing_note = (
+                        f"{service_command} 输出未标记任何正在运行的服务"
+                    )
+            else:
+                record_service_error(service_command, stderr)
+
+        service_data_available = bool(running_service_details)
+        if not service_data_available and service_listing_note:
+            service_data_available = True
+
+        if running_service_details:
+            source_label = service_listing_source or "服务列表"
+            subitems[0]["details"].append(
+                f"当前运行服务清单 ({source_label} 输出):"
+            )
+            subitems[0]["details"].extend(
+                f" - {detail}" for detail in running_service_details
+            )
+        elif service_listing_note:
+            subitems[0]["details"].append(service_listing_note)
+        else:
+            for error in service_errors or ["未能获取运行服务列表"]:
+                subitems[0]["details"].append(f"无法列出运行服务: {error}")
+
         if running_services:
             subitems[0]["status"] = "FAIL"
-            subitems[0]["details"].append("发现运行中的不必要服务: " + ", ".join(sorted(set(running_services))))
-            subitems[0]["recommendation"].append("请使用systemctl disable --now <service>停用相关服务")
-        else:
+            subitems[0]["details"].append(
+                "发现运行中的不必要服务: " + ", ".join(sorted(set(running_services)))
+            )
+            subitems[0]["recommendation"].append(
+                "请使用systemctl disable --now <service>停用相关服务"
+            )
+        elif service_data_available:
             subitems[0]["details"].append("未检测到运行中的高危服务")
 
         listening_ports: List[str] = []
-        rc, stdout, _ = self.run_command('ss -tuln')
-        if rc != 0 or not stdout:
-            rc, stdout, _ = self.run_command('netstat -tuln')
+        listener_details: List[str] = []
+        listener_command_used = ""
+        port_errors: List[str] = []
+
+        def record_port_error(command: str, stderr_output: str) -> None:
+            message = stderr_output.strip() if stderr_output else "命令无输出"
+            port_errors.append(f"{command}: {message}")
+
+        def register_listener(proto: str, local: str, state: str) -> None:
+            detail = f"{proto} {local}"
+            if state:
+                detail += f" 状态={state}"
+            listener_details.append(detail)
+            port_value = extract_port(local)
+            if port_value is not None and port_value in HIGH_RISK_PORTS:
+                listening_ports.append(
+                    f"端口{port_value}({HIGH_RISK_PORTS[port_value]})"
+                )
+
+        def extract_port(local: str) -> Optional[int]:
+            if ':' not in local:
+                return None
+            port_segment = local.rsplit(':', 1)[-1]
+            try:
+                return int(port_segment)
+            except ValueError:
+                if ']:' in local:
+                    try:
+                        return int(local.rsplit(']:', 1)[-1])
+                    except ValueError:
+                        return None
+                return None
+
+        rc, stdout, stderr = self.run_command('ss -tuln')
         if rc == 0 and stdout:
-            for line in stdout.splitlines():
+            listener_command_used = 'ss -tuln'
+            for raw_line in stdout.splitlines():
+                line = raw_line.strip()
+                if not line or line.lower().startswith('netid'):
+                    continue
                 parts = line.split()
                 if len(parts) < 5:
                     continue
+                proto = parts[0]
+                state = parts[1]
                 local = parts[4]
-                if ':' not in local:
-                    continue
-                try:
-                    port = int(local.rsplit(':', 1)[1])
-                except ValueError:
-                    continue
-                if port in HIGH_RISK_PORTS:
-                    listening_ports.append(f"端口{port}({HIGH_RISK_PORTS[port]})")
+                register_listener(proto, local, state)
+        else:
+            record_port_error('ss -tuln', stderr)
+
+        if not listener_details:
+            rc, stdout, stderr = self.run_command('netstat -tuln')
+            if rc == 0 and stdout:
+                listener_command_used = 'netstat -tuln'
+                for raw_line in stdout.splitlines():
+                    line = raw_line.strip()
+                    if not line or line.lower().startswith('proto'):
+                        continue
+                    parts = line.split()
+                    if len(parts) < 4:
+                        continue
+                    proto = parts[0]
+                    local = parts[3]
+                    state = parts[5] if len(parts) > 5 else ''
+                    register_listener(proto, local, state)
+            else:
+                record_port_error('netstat -tuln', stderr)
+
+        if not listener_details:
+            tcp_states = {
+                '01': 'ESTABLISHED',
+                '02': 'SYN_SENT',
+                '03': 'SYN_RECV',
+                '04': 'FIN_WAIT1',
+                '05': 'FIN_WAIT2',
+                '06': 'TIME_WAIT',
+                '07': 'CLOSE',
+                '08': 'CLOSE_WAIT',
+                '09': 'LAST_ACK',
+                '0A': 'LISTEN',
+                '0B': 'CLOSING',
+            }
+
+            def parse_proc_net(protocol: str) -> List[Tuple[str, str, str]]:
+                path = f"/proc/net/{protocol}"
+                content = self.read_file(path)
+                if not content:
+                    return []
+                entries: List[Tuple[str, str, str]] = []
+                for raw_line in content.splitlines()[1:]:
+                    parts = raw_line.split()
+                    if len(parts) < 2:
+                        continue
+                    local_field = parts[1]
+                    state_field = parts[3] if len(parts) > 3 else ''
+                    if ':' not in local_field:
+                        continue
+                    ip_hex, port_hex = local_field.split(':', 1)
+                    try:
+                        port_value = int(port_hex, 16)
+                    except ValueError:
+                        continue
+                    if port_value == 0:
+                        continue
+                    try:
+                        if protocol.endswith('6'):
+                            raw_bytes = bytes.fromhex(ip_hex)
+                            if len(raw_bytes) == 16:
+                                reordered = b"".join(
+                                    raw_bytes[i : i + 4][::-1]
+                                    for i in range(0, 16, 4)
+                                )
+                            else:
+                                reordered = raw_bytes
+                            ip_address = socket.inet_ntop(
+                                socket.AF_INET6, reordered
+                            )
+                        else:
+                            ip_address = socket.inet_ntop(
+                                socket.AF_INET, struct.pack('<I', int(ip_hex, 16))
+                            )
+                    except Exception:  # pylint: disable=broad-except
+                        ip_address = ip_hex
+                    state_name = tcp_states.get(state_field.upper(), state_field.upper())
+                    entries.append((protocol, f"{ip_address}:{port_value}", state_name))
+                return entries
+
+            proc_entries: List[Tuple[str, str, str]] = []
+            for proto in ('tcp', 'tcp6', 'udp', 'udp6'):
+                proc_entries.extend(parse_proc_net(proto))
+            if proc_entries:
+                listener_command_used = '/proc/net'
+                for proto, local, state in proc_entries:
+                    register_listener(proto, local, state)
+            else:
+                port_errors.append('/proc/net: 未能读取内核网络套接字信息')
+
+        port_data_available = bool(listener_details)
+        if port_data_available:
+            source_label = listener_command_used or '监听端口列表'
+            subitems[1]["details"].append(
+                f"监听端口清单 ({source_label} 输出):"
+            )
+            subitems[1]["details"].extend(
+                f" - {entry}" for entry in listener_details
+            )
+        else:
+            for error in port_errors or ["未能获取监听端口信息"]:
+                subitems[1]["details"].append(f"无法列出监听端口: {error}")
+
         if listening_ports:
             subitems[1]["status"] = "FAIL"
-            subitems[1]["details"].append("检测到高危监听端口: " + ", ".join(sorted(set(listening_ports))))
+            subitems[1]["details"].append(
+                "检测到高危监听端口: " + ", ".join(sorted(set(listening_ports)))
+            )
             subitems[1]["recommendation"].append("请关闭检测到的高危端口")
-        else:
+        elif port_data_available:
             subitems[1]["details"].append("未发现高危监听端口")
 
         self.finalize_item(item, subitems)
@@ -3280,7 +4645,11 @@ class LinuxComplianceChecker:
         ]
 
         ssh_config = self.read_file('/etc/ssh/sshd_config')
-        restrictions_found = []
+        restrictions_found: List[str] = []
+        allow_directives: List[str] = []
+        deny_directives: List[str] = []
+        match_directives: List[str] = []
+        listen_directives: List[str] = []
         if ssh_config:
             for line in ssh_config.splitlines():
                 cleaned = line.split('#', 1)[0].strip()
@@ -3288,32 +4657,90 @@ class LinuxComplianceChecker:
                     continue
                 lower = cleaned.lower()
                 if lower.startswith('allowusers') or lower.startswith('allowgroups'):
+                    allow_directives.append(cleaned)
                     restrictions_found.append(cleaned)
-                if lower.startswith('denyusers') or lower.startswith('denygroups'):
+                elif lower.startswith('denyusers') or lower.startswith('denygroups'):
+                    deny_directives.append(cleaned)
                     restrictions_found.append(cleaned)
-                if lower.startswith('match') and 'address' in lower:
+                elif lower.startswith('match') and 'address' in lower:
+                    match_directives.append(cleaned)
                     restrictions_found.append(cleaned)
-                if lower.startswith('listenaddress') and '0.0.0.0' not in lower and '::' not in lower:
-                    restrictions_found.append(cleaned)
-        if restrictions_found:
-            subitems[0]["details"].append("SSH配置已对管理源进行限制")
-            subitems[0]["details"].extend(restrictions_found)
+                elif lower.startswith('listenaddress'):
+                    listen_directives.append(cleaned)
+                    if '0.0.0.0' not in lower and '::' not in lower:
+                        restrictions_found.append(cleaned)
         else:
-            subitems[0]["details"].append("未在SSH配置中发现管理源限制")
+            subitems[0]["details"].append("无法读取/etc/ssh/sshd_config，无法确认SSH源限制配置")
+
+        if restrictions_found:
+            subitems[0]["details"].append("SSH配置已对管理源进行限制:")
+            subitems[0]["details"].extend(f" - {line}" for line in restrictions_found)
+        else:
+            if ssh_config:
+                if listen_directives:
+                    subitems[0]["details"].append("sshd_config监听地址配置:")
+                    subitems[0]["details"].extend(
+                        f" - {line}" for line in listen_directives
+                    )
+                else:
+                    subitems[0]["details"].append(
+                        "sshd_config未显式设置ListenAddress（默认监听所有地址）"
+                    )
+                if not (allow_directives or deny_directives or match_directives):
+                    subitems[0]["details"].append(
+                        "未配置AllowUsers/AllowGroups/DenyUsers/DenyGroups/Match Address指令"
+                    )
 
         firewall_evidence: List[str] = []
-        rc, stdout, _ = self.run_command('firewall-cmd --list-sources')
+        firewall_notes: List[str] = []
+        rc, stdout, stderr = self.run_command('firewall-cmd --list-sources')
         if rc == 0 and stdout:
-            firewall_evidence.append("firewalld允许的源: " + stdout)
+            firewall_evidence.append("firewalld允许的源:")
+            firewall_evidence.extend(
+                f" - {entry.strip()}" for entry in stdout.splitlines() if entry.strip()
+            )
+        elif rc == 0:
+            firewall_notes.append("firewalld未配置特定源地址限制（返回空列表）")
         else:
-            rc, stdout, _ = self.run_command('iptables -S INPUT')
+            message = stderr or stdout
+            if message:
+                firewall_notes.append(
+                    f"firewall-cmd --list-sources 返回错误信息: {message.strip()}"
+                )
+            else:
+                firewall_notes.append(
+                    "firewall-cmd --list-sources 未能提供允许的源地址信息"
+                )
+
+        if not firewall_evidence:
+            rc, stdout, stderr = self.run_command('iptables -S INPUT')
             if rc == 0 and stdout:
                 restricted_rules = [line for line in stdout.splitlines() if '-s' in line]
                 if restricted_rules:
                     firewall_evidence.append("iptables源地址限制规则:")
-                    firewall_evidence.extend(restricted_rules[:5])
+                    firewall_evidence.extend(
+                        f" - {line}" for line in restricted_rules[:5]
+                    )
+                else:
+                    firewall_notes.append(
+                        "iptables INPUT 链未检测到包含-s参数的源地址限制规则"
+                    )
+            elif rc != 0:
+                message = stderr or stdout
+                if message:
+                    firewall_notes.append(
+                        f"iptables -S INPUT 返回错误信息: {message.strip()}"
+                    )
+                else:
+                    firewall_notes.append(
+                        "iptables -S INPUT 未能提供源地址限制规则"
+                    )
+
         if firewall_evidence:
             subitems[0]["details"].extend(firewall_evidence)
+        if firewall_notes:
+            subitems[0]["details"].extend(firewall_notes)
+
         if not restrictions_found and not firewall_evidence:
             subitems[0]["status"] = "FAIL"
             subitems[0]["details"].append("未检测到SSH或防火墙对管理终端来源的限制")
@@ -3328,53 +4755,271 @@ class LinuxComplianceChecker:
             self.make_subitem("3. 应核查识别恶意行为时是否能够有效阻断"),
         ]
 
-        antivirus_tools = {
-            'clamscan': 'ClamAV病毒扫描器',
-            'freshclam': 'ClamAV病毒库更新',
-            'maldet': 'Maldet恶意代码检测',
-            'chkrootkit': 'Chkrootkit根kit检测',
-            'rkhunter': 'Rootkit Hunter检测',
-        }
-        available_tools = [desc for cmd, desc in antivirus_tools.items() if shutil.which(cmd)]
-        if available_tools:
-            subitems[0]["details"].append("检测到防恶意代码工具: " + ", ".join(available_tools))
+        antivirus_candidates = [
+            {
+                "command": "clamscan",
+                "description": "ClamAV病毒扫描器",
+                "packages": ["clamav", "clamav-base", "clamav-daemon"],
+            },
+            {
+                "command": "freshclam",
+                "description": "ClamAV病毒库更新",
+                "packages": ["clamav", "clamav-freshclam"],
+            },
+            {
+                "command": "maldet",
+                "description": "Maldet恶意代码检测",
+                "packages": ["maldet"],
+            },
+            {
+                "command": "chkrootkit",
+                "description": "Chkrootkit根kit检测",
+                "packages": ["chkrootkit"],
+            },
+            {
+                "command": "rkhunter",
+                "description": "Rootkit Hunter检测",
+                "packages": ["rkhunter"],
+            },
+        ]
+
+        detected_antivirus: List[str] = []
+        missing_antivirus: List[str] = []
+        inspected_antivirus: List[str] = []
+
+        for candidate in antivirus_candidates:
+            command = candidate["command"]
+            description = candidate["description"]
+            inspected_antivirus.append(f"{description} ({command})")
+
+            path = shutil.which(command)
+            package_summaries: List[str] = []
+            for package in candidate.get("packages", []):
+                summary = self.describe_package_installation(package)
+                if summary and summary not in package_summaries:
+                    package_summaries.append(summary)
+
+            detail_parts = [f"{description} ({command})"]
+            if path:
+                detail_parts.append(f"路径={path}")
+            if package_summaries:
+                detail_parts.append("包信息: " + "; ".join(package_summaries))
+
+            if path or package_summaries:
+                detected_antivirus.append(", ".join(detail_parts))
+            else:
+                missing_antivirus.append(f"{description} ({command})")
+
+        if detected_antivirus:
+            subitems[0]["details"].append("检测到防恶意代码工具清单:")
+            subitems[0]["details"].extend(detected_antivirus)
         else:
             subitems[0]["status"] = "FAIL"
             subitems[0]["details"].append("未检测到常见的恶意代码防护工具")
-            subitems[0]["recommendation"].append("请部署ClamAV、商业杀毒或可信验证机制，并定期更新病毒库")
+            if inspected_antivirus:
+                subitems[0]["details"].append(
+                    "已检查的候选工具: " + ", ".join(inspected_antivirus)
+                )
+            subitems[0]["recommendation"].append(
+                "请部署ClamAV、商业杀毒或可信验证机制，并定期更新病毒库"
+            )
 
-        integrity_tools = {
-            'aide': 'AIDE完整性检查',
-            'tripwire': 'Tripwire完整性监控',
-            'samhain': 'Samhain完整性监控',
-        }
-        active_immunity = [desc for cmd, desc in integrity_tools.items() if shutil.which(cmd)]
-        if active_immunity:
-            subitems[1]["details"].append("检测到主动免疫/可信验证工具: " + ", ".join(active_immunity))
+        integrity_candidates = [
+            {
+                "command": "aide",
+                "description": "AIDE完整性检查",
+                "packages": ["aide"],
+            },
+            {
+                "command": "tripwire",
+                "description": "Tripwire完整性监控",
+                "packages": ["tripwire"],
+            },
+            {
+                "command": "samhain",
+                "description": "Samhain完整性监控",
+                "packages": ["samhain"],
+            },
+        ]
+
+        detected_integrity: List[str] = []
+        missing_integrity: List[str] = []
+        inspected_integrity: List[str] = []
+
+        for candidate in integrity_candidates:
+            command = candidate["command"]
+            description = candidate["description"]
+            inspected_integrity.append(f"{description} ({command})")
+
+            path = shutil.which(command)
+            package_summaries: List[str] = []
+            for package in candidate.get("packages", []):
+                summary = self.describe_package_installation(package)
+                if summary and summary not in package_summaries:
+                    package_summaries.append(summary)
+
+            detail_parts = [f"{description} ({command})"]
+            if path:
+                detail_parts.append(f"路径={path}")
+            if package_summaries:
+                detail_parts.append("包信息: " + "; ".join(package_summaries))
+
+            if path or package_summaries:
+                detected_integrity.append(", ".join(detail_parts))
+            else:
+                missing_integrity.append(f"{description} ({command})")
+
+        if detected_integrity:
+            subitems[1]["details"].append("检测到主动免疫/可信验证工具:")
+            subitems[1]["details"].extend(detected_integrity)
         else:
             subitems[1]["status"] = "FAIL"
             subitems[1]["details"].append("未检测到AIDE/Tripwire等可信验证技术")
-            subitems[1]["recommendation"].append("建议部署AIDE、Tripwire等完整性监控以提升主动免疫能力")
+            if inspected_integrity:
+                subitems[1]["details"].append(
+                    "已检查的候选工具: " + ", ".join(inspected_integrity)
+                )
+            subitems[1]["recommendation"].append(
+                "建议部署AIDE、Tripwire等完整性监控以提升主动免疫能力"
+            )
 
         service_names = [
-            'clamd',
-            'clamav-daemon',
-            'freshclam',
-            'maldet',
-            'rkhunter',
-            'chkrootkit',
+            "clamd",
+            "clamav-daemon",
+            "freshclam",
+            "maldet",
+            "rkhunter",
+            "chkrootkit",
         ]
+        systemctl_available = shutil.which("systemctl") is not None
+        service_cmd = shutil.which("service")
         active_services: List[str] = []
+        service_details: List[str] = []
+        missing_services: List[str] = []
+        systemd_error_message: Optional[str] = None
+
         for service in service_names:
-            rc, stdout, _ = self.run_command(f'systemctl is-active {service}')
-            if rc == 0 and stdout.strip() == 'active':
-                active_services.append(service)
+            status_fragments: List[str] = []
+            service_missing = False
+            systemd_failed = False
+
+            if systemctl_available:
+                rc_active, stdout_active, stderr_active = self.run_command(
+                    f"systemctl is-active {service}"
+                )
+                if rc_active == 0:
+                    if stdout_active:
+                        status_fragments.append(
+                            f"systemctl is-active={stdout_active.strip()}"
+                        )
+                        if stdout_active.strip() == "active":
+                            active_services.append(service)
+                    else:
+                        status_fragments.append("systemctl is-active=无输出")
+                else:
+                    message = (stderr_active or stdout_active or f"返回码 {rc_active}").strip()
+                    if self.message_indicates_systemd_unavailable(message):
+                        systemd_error_message = systemd_error_message or message
+                        systemctl_available = False
+                        systemd_failed = True
+                    elif self.message_indicates_missing_service(message):
+                        service_missing = True
+                    elif stdout_active.strip():
+                        status_fragments.append(
+                            f"systemctl is-active={stdout_active.strip()}"
+                        )
+                    else:
+                        summary = self.summarise_command_output(
+                            message, max_lines=2, max_chars=200
+                        )
+                        status_fragments.append(
+                            f"systemctl is-active 输出: {summary or message}"
+                        )
+
+                if not systemd_failed and not service_missing:
+                    rc_enabled, stdout_enabled, stderr_enabled = self.run_command(
+                        f"systemctl is-enabled {service}"
+                    )
+                    if rc_enabled == 0 and stdout_enabled:
+                        status_fragments.append(
+                            f"systemctl is-enabled={stdout_enabled.strip()}"
+                        )
+                    elif rc_enabled != 0:
+                        message = (stderr_enabled or stdout_enabled or f"返回码 {rc_enabled}").strip()
+                        if self.message_indicates_systemd_unavailable(message):
+                            systemd_error_message = systemd_error_message or message
+                            systemctl_available = False
+                            systemd_failed = True
+                        elif self.message_indicates_missing_service(message):
+                            service_missing = True
+                        elif stdout_enabled.strip():
+                            status_fragments.append(
+                                f"systemctl is-enabled={stdout_enabled.strip()}"
+                            )
+                        else:
+                            summary = self.summarise_command_output(
+                                message, max_lines=2, max_chars=200
+                            )
+                            status_fragments.append(
+                                f"systemctl is-enabled 输出: {summary or message}"
+                            )
+
+            if (not systemctl_available or systemd_failed) and service_cmd and not service_missing:
+                rc_service, stdout_service, stderr_service = self.run_command(
+                    f"service {service} status"
+                )
+                if rc_service == 0:
+                    summary = self.summarise_command_output(stdout_service)
+                    status_fragments.append(
+                        f"service status 正常: {summary or '命令无输出'}"
+                    )
+                else:
+                    message = (stderr_service or stdout_service or f"返回码 {rc_service}").strip()
+                    if self.message_indicates_missing_service(message):
+                        service_missing = True
+                    else:
+                        summary = self.summarise_command_output(
+                            message, max_lines=2, max_chars=200
+                        )
+                        status_fragments.append(
+                            f"service status 输出: {summary or message}"
+                        )
+
+            if service_missing:
+                missing_services.append(service)
+                continue
+
+            if status_fragments:
+                service_details.append(f"{service}: " + "; ".join(status_fragments))
+
         if active_services:
-            subitems[2]["details"].append("恶意代码防护服务正在运行: " + ", ".join(active_services))
+            subitems[2]["details"].append(
+                "恶意代码防护服务正在运行: " + ", ".join(sorted(set(active_services)))
+            )
         else:
             subitems[2]["status"] = "FAIL"
             subitems[2]["details"].append("未检测到活跃的恶意代码防护服务")
-            subitems[2]["recommendation"].append("请启动病毒查杀服务或配置实时监控以便及时阻断恶意行为")
+            subitems[2]["recommendation"].append(
+                "请启动病毒查杀服务或配置实时监控以便及时阻断恶意行为"
+            )
+
+        if missing_services:
+            subitems[2]["details"].append(
+                "未发现以下恶意代码防护服务单元: "
+                + ", ".join(sorted(set(missing_services)))
+            )
+
+        if systemd_error_message:
+            summary = self.summarise_command_output(
+                systemd_error_message, max_lines=2, max_chars=200
+            )
+            subitems[2]["details"].append(
+                "systemctl 状态查询不可用: " + (summary or systemd_error_message)
+            )
+
+        if service_details:
+            subitems[2]["details"].append("恶意代码防护服务状态记录:")
+            subitems[2]["details"].extend(service_details)
 
         self.finalize_item(item, subitems)
     def generate_report(self) -> None:
@@ -3383,33 +5028,58 @@ class LinuxComplianceChecker:
         print(f"系统信息: {self.os_info['distribution']} {self.os_info['machine']}\n")
 
         pass_count = fail_count = error_count = 0
-        for category, data in CHECK_ITEMS.items():
-            print(f"\n{Colors.BLUE}【{data['title']}】{Colors.END}")
+        active_modules = self.selected_modules or list(MODULE_METHODS.keys())
+        for module in active_modules:
+            data = CHECK_ITEMS.get(module)
+            if not data:
+                continue
+
+            print()
+            category_heading = self.render_heading(data['title'], level=1)
+            if category_heading:
+                print(category_heading)
+
             for item_id, metadata in data['items'].items():
-                result = self.results.get(item_id, {"status": "UNKNOWN", "details": [], "recommendation": "", "subitems": []})
+                result = self.results.get(
+                    item_id,
+                    {"status": "UNKNOWN", "details": [], "recommendation": "", "subitems": []},
+                )
                 status = result['status']
                 if status == 'PASS':
-                    colour = Colors.GREEN
+                    heading_colour = Colors.BOLD_GREEN
                     pass_count += 1
                 elif status == 'FAIL':
-                    colour = Colors.RED
+                    heading_colour = Colors.BOLD_RED
                     fail_count += 1
                 else:
-                    colour = Colors.YELLOW
+                    heading_colour = Colors.BOLD_YELLOW
                     error_count += 1
-                print(f"\n{colour}[{status}]{Colors.END} {item_id}")
+
+                item_heading = self.render_heading(
+                    f"{item_id} · {status}",
+                    level=2,
+                    colour=heading_colour,
+                )
+                print()
+                print(item_heading)
+
                 indicator = metadata.get('indicator')
                 if indicator:
-                    print(f"   - 测评指标: {indicator}")
+                    emphasised_indicator = (
+                        self.emphasise_primary_text(indicator) or indicator
+                    )
+                    print(f"   {Colors.BOLD}- 测评指标:{Colors.END} {emphasised_indicator}")
+
                 implementation = metadata.get('implementation', [])
                 if implementation:
-                    print("   - 测评实施包括以下内容:")
+                    print(f"   {Colors.BOLD}- 测评实施包括以下内容:{Colors.END}")
                     for step in implementation:
-                        print(f"     * {step}")
+                        emphasised_step = self.emphasise_primary_text(step) or step
+                        print(f"     * {emphasised_step}")
 
                 subitems = result.get('subitems', [])
                 if subitems:
-                    print("   - 子项检查结果:")
+                    print(f"   {Colors.BOLD}- 子项检查结果:{Colors.END}")
                     for sub in subitems:
                         sub_status = sub.get('status', 'PASS')
                         if sub_status == 'PASS':
@@ -3418,22 +5088,33 @@ class LinuxComplianceChecker:
                             sub_colour = Colors.RED
                         else:
                             sub_colour = Colors.YELLOW
-                        print(f"     {sub_colour}[{sub_status}]{Colors.END} {sub['description']}")
+                        emphasised_sub_desc = (
+                            self.emphasise_primary_text(sub.get('description', ''))
+                            or sub.get('description', '')
+                        )
+                        print(
+                            f"     {sub_colour}[{sub_status}]{Colors.END} {emphasised_sub_desc}"
+                        )
                         for detail in sub.get('details', []):
                             print(f"       - {detail}")
                         recommendations = sub.get('recommendation', [])
                         if recommendations and sub_status != 'PASS':
                             for rec in recommendations:
-                                print(f"       {Colors.YELLOW}整改建议:{Colors.END} {rec}")
+                                emphasised_rec = (
+                                    self.emphasise_primary_text(rec) or rec
+                                )
+                                print(
+                                    f"       {Colors.YELLOW}整改建议:{Colors.END} {emphasised_rec}"
+                                )
                 else:
                     details = result.get('details', [])
                     if details:
-                        print("   - 检查详情:")
+                        print(f"   {Colors.BOLD}- 检查详情:{Colors.END}")
                         for detail in details:
                             print(f"     * {detail}")
                     recommendation = result.get('recommendation')
                     if recommendation and status != 'PASS':
-                        print(f"   - {Colors.YELLOW}整改建议:{Colors.END} {recommendation}")
+                        print(f"   {Colors.BOLD_YELLOW}整改建议:{Colors.END} {recommendation}")
 
         total = pass_count + fail_count + error_count
         print(f"\n{Colors.CYAN}=== 检查结果汇总 ==={Colors.END}")
@@ -3441,17 +5122,40 @@ class LinuxComplianceChecker:
         print(f"{Colors.RED}不符合项: {fail_count}/{total}{Colors.END}")
         print(f"{Colors.YELLOW}检查错误: {error_count}/{total}{Colors.END}")
 
+        skipped = [module for module in CHECK_MODULES if module not in active_modules]
+        if skipped:
+            titles = ", ".join(
+                f"{module}({CHECK_MODULES[module]['title']})" for module in skipped
+            )
+            print(
+                f"\n{Colors.YELLOW}提示:{Colors.END} 以下模块未执行检查: {titles}"
+            )
+
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         report_file = f"compliance_report_{timestamp}.txt"
         with open(report_file, "w", encoding="utf-8") as report:
             report.write("=== 三级等保合规检查报告 ===\n")
             report.write(f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
             report.write(f"系统信息: {self.os_info['distribution']} {self.os_info['machine']}\n\n")
-            for category, data in CHECK_ITEMS.items():
-                report.write(f"\n【{data['title']}】\n")
+            for module in active_modules:
+                data = CHECK_ITEMS.get(module)
+                if not data:
+                    continue
+                report.write("\n")
+                report.write(self.render_heading(data['title'], level=1, plain=True))
+                report.write("\n")
                 for item_id, metadata in data['items'].items():
                     result = self.results.get(item_id, {"status": "UNKNOWN", "details": [], "recommendation": "", "subitems": []})
-                    report.write(f"\n[{result['status']}] {item_id}\n")
+                    status = result['status']
+                    report.write("\n")
+                    report.write(
+                        self.render_heading(
+                            f"{item_id} · {status}",
+                            level=2,
+                            plain=True,
+                        )
+                    )
+                    report.write("\n")
                     indicator = metadata.get('indicator')
                     if indicator:
                         report.write(f"   - 测评指标: {indicator}\n")
@@ -3484,6 +5188,14 @@ class LinuxComplianceChecker:
             report.write(f"符合项: {pass_count}/{total}\n")
             report.write(f"不符合项: {fail_count}/{total}\n")
             report.write(f"检查错误: {error_count}/{total}\n")
+            if skipped:
+                report.write(
+                    "未执行模块: "
+                    + ", ".join(
+                        f"{module}({CHECK_MODULES[module]['title']})" for module in skipped
+                    )
+                    + "\n"
+                )
         print(f"\n{Colors.GREEN}报告已保存到: {report_file}{Colors.END}")
 
     def generate_remediation_report(self) -> None:
@@ -3541,7 +5253,5 @@ class LinuxComplianceChecker:
             label = self.format_status_label(status)
             print(f" {label}: {count}")
         print(f"{Colors.GREEN}整改报告已保存到: {report_path}{Colors.END}")
-if __name__ == "__main__":
-    checker = LinuxComplianceChecker()
-    if checker.check_root_privilege():
-        checker.run_check()
+if __name__ == "__main__":  # pragma: no cover - CLI entrypoint
+    sys.exit(main())
