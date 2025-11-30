@@ -1,38 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
-"""Lightweight harness for the (commented) Linux compliance checker logic.
-
-The original, fully fledged remediation workflow is still preserved below as a
-comment-only reference.  This executable shim adds a small command line
-interface so operators can choose which模块 (module groups) to evaluate when
-the full checker implementation is eventually restored.  While the detailed
-checks remain disabled, the CLI itself is functional and can be wired to real
-logic later on.
-
-Usage examples
---------------
-
-* 列出可用模块::
-
-      python scripts/linux_compliance_checker.py --list-modules
-
-* 仅运行身份鉴别与安全审计::
-
-      python scripts/linux_compliance_checker.py --include-module identity,audit
-
-* 跳过入侵防范模块::
-
-      python scripts/linux_compliance_checker.py --exclude-module intrusion_prevention,malware_protection
-
 """
-
+* 列出可用模块::
+      python3 Linux.py --list-modules
+* 仅运行身份鉴别与安全审计::
+      python3 Linux.py --include-module identity,audit
+* 跳过入侵防范模块::
+      python3 Linux.py --exclude-module intrusion_prevention,malware_protection
+"""
 import argparse
 import sys
 from datetime import datetime, timedelta
-from typing import Dict, Iterable, List, Optional, Set, Tuple
-
-
+from typing import Dict, Iterable, List, Optional, Set, TextIO, Tuple
 # 供 CLI 使用的模块索引，键名称与之前被注释掉的 CHECK_ITEMS 结构保持一致。
 CHECK_MODULES: Dict[str, Dict[str, str]] = {
     "identity": {"title": "8.1.4.1 身份鉴别"},
@@ -40,8 +19,13 @@ CHECK_MODULES: Dict[str, Dict[str, str]] = {
     "audit": {"title": "8.1.4.3 安全审计"},
     "intrusion_prevention": {"title": "8.1.4.4 入侵防范"},
     "malware_protection": {"title": "8.1.4.5 恶意代码防范"},
+    "trusted_verification": {"title": "8.1.4.6 可信验证"},
+    "data_integrity": {"title": "8.1.4.7 数据完整性"},
+    "data_confidentiality": {"title": "8.1.4.8 数据保密性"},
+    "data_backup_recovery": {"title": "8.1.4.9 数据备份恢复"},
+    "residual_information": {"title": "8.1.4.10 剩余信息保护"},
+    "personal_information": {"title": "8.1.4.11 个人信息保护"},
 }
-
 # 每个模块对应的检查函数，名称与 LinuxComplianceChecker 中的方法一致。
 MODULE_METHODS: Dict[str, List[str]] = {
     "identity": [
@@ -55,42 +39,65 @@ MODULE_METHODS: Dict[str, List[str]] = {
         "check_ces1_06_default_account_management",
         "check_ces1_07_account_review",
         "check_ces1_08_privilege_separation",
+        "check_ces1_09_policy_configuration",
+        "check_ces1_10_access_control_granularity",
         "check_ces1_11_security_labels",
     ],
     "audit": [
         "check_ces1_12_audit_enablement",
         "check_ces1_13_audit_log_content",
         "check_ces1_14_audit_log_protection",
+        "check_ces1_15_audit_process_protection",
     ],
     "intrusion_prevention": [
         "check_ces1_17_minimal_installation",
         "check_ces1_18_service_port_control",
         "check_ces1_19_management_access_control",
+        "check_ces1_20_input_validation",
+        "check_ces1_21_vulnerability_management",
+        "check_ces1_22_intrusion_detection_alerts",
     ],
     "malware_protection": [
         "check_ces1_23_malware_protection",
     ],
+    "trusted_verification": [
+        "check_ces1_24_trusted_verification",
+    ],
+    "data_integrity": [
+        "check_ces1_25_integrity_transmission",
+        "check_ces1_26_integrity_storage",
+    ],
+    "data_confidentiality": [
+        "check_ces1_27_confidentiality_transmission",
+        "check_ces1_28_confidentiality_storage",
+    ],
+    "data_backup_recovery": [
+        "check_ces1_29_local_backup_recovery",
+        "check_ces1_30_remote_backup",
+        "check_ces1_31_hot_redundancy",
+    ],
+    "residual_information": [
+        "check_ces1_32_residual_authentication_clearing",
+        "check_ces1_33_residual_sensitive_clearing",
+    ],
+    "personal_information": [
+        "check_ces1_34_personal_info_minimization",
+        "check_ces1_35_personal_info_protection",
+    ],
 }
-
-
 def _normalise(raw_values: Iterable[str]) -> List[str]:
     """Split comma-separated inputs and strip whitespace."""
-
     values: List[str] = []
     for value in raw_values:
         if not value:
             continue
         values.extend(chunk.strip() for chunk in value.split(",") if chunk.strip())
     return values
-
-
 def _validate_modules(modules: Iterable[str]) -> List[str]:
     """Ensure requested模块存在并保持调用顺序。"""
-
     normalised = _normalise(modules)
     if not normalised:
         return []
-
     unknown = set(normalised) - CHECK_MODULES.keys()
     if unknown:
         available = ", ".join(CHECK_MODULES.keys())
@@ -98,7 +105,6 @@ def _validate_modules(modules: Iterable[str]) -> List[str]:
         raise ValueError(
             f"未知模块: {names}。可用模块包括: {available}."
         )
-
     seen: Set[str] = set()
     ordered: List[str] = []
     for module in normalised:
@@ -107,39 +113,27 @@ def _validate_modules(modules: Iterable[str]) -> List[str]:
         seen.add(module)
         ordered.append(module)
     return ordered
-
-
 def _determine_selection(include: Iterable[str], exclude: Iterable[str]) -> List[str]:
     """Return最终需要执行的模块列表。"""
-
     include_list = _validate_modules(include) if include else []
     exclude_list = _validate_modules(exclude) if exclude else []
     exclude_set = set(exclude_list)
-
     if include_list:
         selection = [module for module in include_list if module not in exclude_set]
     else:
         selection = [
             module for module in CHECK_MODULES.keys() if module not in exclude_set
         ]
-
     if not selection:
         raise ValueError("根据 include/exclude 参数过滤后没有剩余模块可供检查。")
-
     return selection
-
-
 def run_selected_modules(selected_modules: List[str]) -> int:
     """执行指定模块的检查及整改流程。"""
-
     checker = LinuxComplianceChecker()
     if not checker.check_root_privilege():
         return 1
-
     checker.run_check(selected_modules)
     return 0
-
-
 def parse_args(argv: List[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Linux 合规性检查器（CLI 占位实现）",
@@ -162,11 +156,8 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
         help="列出支持的模块后退出",
     )
     return parser.parse_args(argv)
-
-
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv if argv is not None else sys.argv[1:])
-
     if args.list_modules:
         print("支持的模块如下：")
         for key, meta in CHECK_MODULES.items():
@@ -176,18 +167,14 @@ def main(argv: Optional[List[str]] = None) -> int:
             )
             print(f"  - {key}: {emphasised_title}")
         return 0
-
     try:
         selected_modules = _determine_selection(args.include_module, args.exclude_module)
     except ValueError as exc:  # pragma: no cover - CLI 参数错误时提示并退出
         print(f"错误: {exc}", file=sys.stderr)
         return 1
-
     return run_selected_modules(selected_modules)
-
 # #!/usr/bin/env python3
 # # -*- coding: utf-8 -*-
-
 import os
 import re
 import pwd
@@ -202,11 +189,8 @@ from datetime import datetime
 from getpass import getpass
 import platform
 from typing import Dict, List, Optional, Set, Tuple
-
-
 class Colors:
     """Terminal colour helpers."""
-
     RED = "\033[91m"
     GREEN = "\033[92m"
     YELLOW = "\033[93m"
@@ -221,7 +205,6 @@ class Colors:
     BOLD_YELLOW = "\033[1;33m"
     END = "\033[0m"
 
-
 CHECK_ITEMS: Dict[str, Dict[str, object]] = {
     "identity": {
         "title": "8.1.4.1 身份鉴别",
@@ -229,30 +212,30 @@ CHECK_ITEMS: Dict[str, Dict[str, object]] = {
             "L3-CES1-01": {
                 "indicator": "应对登录的用户进行身份标识和鉴别，身份标识具有唯一性，身份鉴别信息具有复杂度要求并定期更换。",
                 "implementation": [
-                    "应核查用户在登录时是否采用了身份鉴别措施；检查 `/etc/pam.d/` 下的认证配置（如 `system-auth`, `login`），查看是否配置了 `pam_unix.so` 或其他认证模块。",
-                    "应核查用户列表确认用户身份标识是否具有唯一性；解析 `/etc/passwd`，检查用户名和UID是否唯一。",
-                    "应核查用户配置信息或测试验证是否不存在空口令用户；检查 `/etc/shadow` 文件中第二个字段为空的账户（需要root权限），如 `sudo awk -F: '($2 == \"\" ) { print $1 }' /etc/shadow`。",
-                    "应核查用户鉴别信息是否具有复杂度要求并定期更换。复杂度: 检查 `/etc/pam.d/system-auth` 或 `/etc/security/pwquality.conf` 中是否存在 `pam_pwquality.so` 及相关配置（如 `minlen`, `dcredit` 等）。定期更换: 检查 `/etc/login.defs` 中的 `PASS_MAX_DAYS` 等参数，以及 `/etc/shadow` 中用户密码的最后修改时间和最大天数。",
+                    "应核查用户在登录时是否采用了身份鉴别措施；",
+                    "应核查用户列表确认用户身份标识是否具有唯一性；",
+                    "应核查用户配置信息或测试验证是否不存在空口令用户；",
+                    "应核查用户鉴别信息是否具有复杂度要求并定期更换。",
                 ],
             },
             "L3-CES1-02": {
                 "indicator": "应具有登录失败处理功能，应配置并启用结束会话、限制非法登录次数和当登录连接超时自动退出等相关措施。",
                 "implementation": [
-                    "应核查是否配置并启用了登录失败处理功能。",
-                    "应核查是否配置并启用了限制非法登录功能，非法登录达到一定次数后采取特定动作，如账户锁定等；检查 `/etc/pam.d/system-auth` 和 `/etc/pam.d/sshd` 等，查找 `pam_tally2.so` 或 `pam_faillock.so` 的配置（如 `deny=`, `unlock_time=`）。",
-                    "应核查是否配置并启用了登录连接超时及自动退出功能；检查全局环境变量设置（`/etc/profile`, `/etc/bash.bashrc` 中的 `TMOUT`）以及SSH服务配置（`/etc/ssh/sshd_config` 中的 `ClientAliveInterval` 和 `ClientAliveCountMax`）。",
+                    "应核查是否配置并启用了登录失败处理功能；",
+                    "应核查是否配置并启用了限制非法登录功能，非法登录达到一定次数后采取特定动作，如账户锁定等；",
+                    "应核查是否配置并启用了登录连接超时及自动退出功能。",
                 ],
             },
             "L3-CES1-03": {
                 "indicator": "当进行远程管理时，应采取必要措施防止鉴别信息在网络传输过程中被窃听。",
                 "implementation": [
-                    "应核查是否采用加密等安全方式对系统进行远程管理，防止鉴别信息在网络传输过程中被窃听；检查SSH服务配置（`/etc/ssh/sshd_config`）中 `Protocol` 是否为2，并检查是否禁止了不安全的协议（如 `telnet`, `rlogin`）。",
+                    "应核查是否采用加密等安全方式对系统进行远程管理，防止鉴别信息在网络传输过程中被窃听。",
                 ],
             },
             "L3-CES1-04": {
                 "indicator": "应采用口令、密码技术、生物技术等两种或两种以上组合的鉴别技术对用户进行身份鉴别，且其中一种鉴别技术至少应使用密码技术来实现。",
                 "implementation": [
-                    "应核查是否采用动态口令、数字证书、生物技术和设备指纹等两种或两种以上组合的鉴别技术对用户身份进行鉴别；检查PAM配置（如 `/etc/pam.d/sshd`），查看是否除了 `pam_unix.so` 外，还配置了第二个认证模块（如 `pam_google_authenticator.so`、`pam_sss.so`）。",
+                    "应核查是否采用动态口令、数字证书、生物技术和设备指纹等两种或两种以上组合的鉴别技术对用户身份进行鉴别；",
                     "应核查其中一种鉴别技术是否使用密码技术来实现。",
                 ],
             },
@@ -264,37 +247,51 @@ CHECK_ITEMS: Dict[str, Dict[str, object]] = {
             "L3-CES1-05": {
                 "indicator": "应对登录的用户分配账户和权限。",
                 "implementation": [
-                    "应核查是否为用户分配了账户和权限及相关设置情况；可以列出所有用户（`/etc/passwd`）和组（`/etc/group`）。",
-                    "应核查是否已禁用或限制匿名、默认账户的访问权限；检查默认账户如 `root`, `bin`, `daemon` 等的登录shell是否为 `/sbin/nologin` 或 `/bin/false`。",
+                    "应核查是否为用户分配了账户和权限及相关设置情况；",
+                    "应核查是否已禁用或限制匿名、默认账户的访问权限。",
                 ],
             },
             "L3-CES1-06": {
                 "indicator": "应重命名或删除默认账户，修改默认账户的默认口令。",
                 "implementation": [
-                    "应核查是否已经重命名默认账户或默认账户已被删除；检查 `/etc/passwd` 中UID为0的账户名是否为 `root` 或其他名称，并关注 `admin`, `test` 等常见默认账户。",
+                    "应核查是否已经重命名默认账户或默认账户已被删除；",
                     "应核查是否已修改默认账户的默认口令。",
                 ],
             },
             "L3-CES1-07": {
                 "indicator": "应及时删除或停用多余的、过期的账户，避免共享账户的存在。",
                 "implementation": [
-                    "应核查是否不存在多余或过期账户，管理员用户与账户之间是否一一对应。",
-                    "应测试验证多余的、过期的账户是否被删除或停用；可以列出所有账户，并与人工提供的合法账户清单进行比对，找出差异。",
+                    "应核查是否不存在多余或过期账户，管理员用户与账户之间是否一一对应；",
+                    "应测试验证多余的、过期的账户是否被删除或停用。",
                 ],
             },
             "L3-CES1-08": {
                 "indicator": "应授予管理用户所需的最小权限，实现管理用户的权限分离。",
                 "implementation": [
-                    "应核查是否进行角色划分。",
-                    "应核查管理用户的权限是否已进行分离。",
-                    "应核查管理用户权限是否为其工作任务所需的最小权限；可以检查 `sudo` 配置（`/etc/sudoers`）查看不同用户或组的权限分配，并检查系统关键文件和目录的权限。",
+                    "应核查是否进行角色划分；",
+                    "应核查管理用户的权限是否已进行分离；",
+                    "应核查管理用户权限是否为其工作任务所需的最小权限。",
+                ],
+            },
+            "L3-CES1-09": {
+                "indicator": "应由授权主体配置访问控制策略，访问控制策略规定主体对客体的访问规则。",
+                "implementation": [
+                    "应核查是否由授权主体（如管理用户）负责配置访问控制策略；",
+                    "应核查授权主体是否依据安全策略配置了主体对客体的访问规则；",
+                    "应测试验证用户是否有可越权访问情形。",
+                ],
+            },
+            "L3-CES1-10": {
+                "indicator": "访问控制的粒度应达到主体为用户级或进程级，客体为文件、数据库表级。",
+                "implementation": [
+                    "应核查访问控制策略的控制粒度是否达到主体为用户级或进程级，客体为文件、数据库表、记录或字段级。",
                 ],
             },
             "L3-CES1-11": {
                 "indicator": "应对重要主体和客体设置安全标记，并控制主体对有安全标记信息资源的访问。",
                 "implementation": [
-                    "应核查是否对主体、客体设置了安全标记。",
-                    "应测试验证是否依据主体、客体安全标记控制主体对客体访问的强制访问控制策略；检查系统是否安装了SELinux或AppArmor，并且处于 `Enforcing` 模式（如 `sestatus`, `aa-status` 命令）。",
+                    "应核查是否对主体、客体设置了安全标记；",
+                    "应测试验证是否依据主体、客体安全标记控制主体对客体访问的强制访问控制策略。",
                 ],
             },
         },
@@ -305,22 +302,28 @@ CHECK_ITEMS: Dict[str, Dict[str, object]] = {
             "L3-CES1-12": {
                 "indicator": "应启用安全审计功能，审计覆盖到每个用户，对重要的用户行为和重要安全事件进行审计。",
                 "implementation": [
-                    "应核查是否开启了安全审计功能；检查 `auditd` 服务是否运行，以及 `rsyslog`/`syslog-ng` 等日志服务状态。",
-                    "应核查安全审计范围是否覆盖到每个用户。",
+                    "应核查是否开启了安全审计功能；",
+                    "应核查安全审计范围是否覆盖到每个用户；",
                     "应核查是否对重要的用户行为和重要安全事件进行审计。",
                 ],
             },
             "L3-CES1-13": {
                 "indicator": "审计记录应包括事件的日期和时间、用户、事件类型、事件是否成功及其他与审计相关的信息。",
                 "implementation": [
-                    "应核查审计记录信息是否包括事件的日期和时间、用户、事件类型、事件是否成功及其他与审计相关的信息；检查 `/etc/audit/auditd.conf` 配置，并采样分析审计日志（如 `/var/log/audit/audit.log`）或系统日志格式。",
+                    "应核查审计记录信息是否包括事件的日期和时间、用户、事件类型、事件是否成功及其他与审计相关的信息。",
                 ],
             },
             "L3-CES1-14": {
                 "indicator": "应对审计记录进行保护，定期备份，避免受到未预期的删除、修改或覆盖等。",
                 "implementation": [
-                    "应核查是否采取了保护措施对审计记录进行保护；检查审计日志文件的权限（通常是 `0600`）。",
-                    "应核查是否采取技术措施对审计记录进行定期备份，并核查其备份策略；检查是否有日志轮转配置（如 `logrotate`）或日志服务器配置（如 `rsyslog.conf`）。",
+                    "应核查是否采取了保护措施对审计记录进行保护；",
+                    "应核查是否采取技术措施对审计记录进行定期备份，并核查其备份策略。",
+                ],
+            },
+            "L3-CES1-15": {
+                "indicator": "应对审计进程进行保护，防止未经授权的中断。",
+                "implementation": [
+                    "应测试验证通过非审计管理员的其他账户来中断审计进程，验证审计进程是否受到保护。",
                 ],
             },
         },
@@ -331,21 +334,42 @@ CHECK_ITEMS: Dict[str, Dict[str, object]] = {
             "L3-CES1-17": {
                 "indicator": "应遵循最小安装的原则，仅安装需要的组件和应用程序。",
                 "implementation": [
-                    "应核查是否遵循最小安装原则。",
-                    "应核查是否未安装非必要的组件和应用程序；可以列出已安装的软件包（如 `dpkg -l` 或 `rpm -qa`）并结合系统角色进行判断。",
+                    "应核查是否遵循最小安装原则；",
+                    "应核查是否未安装非必要的组件和应用程序。",
                 ],
             },
             "L3-CES1-18": {
                 "indicator": "应关闭不需要的系统服务、默认共享和高危端口。",
                 "implementation": [
-                    "应核查是否关闭了非必要的系统服务和默认共享；检查系统上所有已启动的服务（如 `systemctl list-units --type=service --state=running`），并与白名单对比。",
-                    "应核查是否不存在非必要的高危端口；检查所有监听端口（如 `ss -tuln`, `netstat -tuln`），并与白名单对比。",
+                    "应核查是否关闭了非必要的系统服务和默认共享；",
+                    "应核查是否不存在非必要的高危端口。",
                 ],
             },
             "L3-CES1-19": {
                 "indicator": "应通过设定终端接入方式或网络地址范围对通过网络进行管理的管理终端进行限制。",
                 "implementation": [
-                    "应核查配置文件或参数是否对终端接入范围进行限制；检查SSH配置（`/etc/ssh/sshd_config`）中的 `AllowUsers`, `AllowGroups`, `DenyUsers`, `DenyGroups` 或防火墙规则是否对管理源地址进行了限制。",
+                    "应核查配置文件或参数是否对终端接入范围进行限制。",
+                ],
+            },
+            "L3-CES1-20": {
+                "indicator": "应提供数据有效性检验功能，保证通过人机接口输入或通过通信接口输入的内容符合系统设定要求。",
+                "implementation": [
+                    "应核查系统设计文档的内容是否包括数据有效性检验功能的内容或模块；",
+                    "应测试验证是否对人机接口或通信接口输入的内容进行有效性检验。",
+                ],
+            },
+            "L3-CES1-21": {
+                "indicator": "应能发现可能存在的已知漏洞，并在经过充分测试评估后，及时修补漏洞。",
+                "implementation": [
+                    "应通过漏洞扫描、渗透测试等方式核查是否不存在高风险漏洞；",
+                    "应核查是否在经过充分测试评估后及时修补漏洞。",
+                ],
+            },
+            "L3-CES1-22": {
+                "indicator": "应能够检测到对重要节点进行入侵的行为，并在发生严重入侵事件时提供报警。",
+                "implementation": [
+                    "应访谈并核查是否有入侵检测的措施；",
+                    "应核查在发生严重入侵事件时是否提供报警。",
                 ],
             },
         },
@@ -356,15 +380,130 @@ CHECK_ITEMS: Dict[str, Dict[str, object]] = {
             "L3-CES1-23": {
                 "indicator": "应采用免受恶意代码攻击的技术措施或主动免疫可信验证机制及时识别入侵和病毒行为，并将其有效阻断。",
                 "implementation": [
-                    "应核查是否安装了防恶意代码软件或相应功能的软件，定期进行升级和更新防恶意代码库。",
-                    "应核查是否采用主动免疫可信验证技术及时识别入侵和病毒行为。",
-                    "应核查当识别入侵和病毒行为时是否将其有效阻断；检查防病毒软件进程是否运行，病毒库更新任务是否存在且最近成功执行。",
+                    "应核查是否安装了防恶意代码软件或相应功能的软件，定期进行升级和更新防恶意代码库；",
+                    "应核查是否采用主动免疫可信验证技术及时识别入侵和病毒行为；",
+                    "应核查当识别入侵和病毒行为时是否将其有效阻断。",
+                ],
+            },
+        },
+    },
+    "trusted_verification": {
+        "title": "8.1.4.6 可信验证",
+        "items": {
+            "L3-CES1-24": {
+                "indicator": "可基于可信根对计算设备的系统引导程序、系统程序、重要配置参数和应用程序等进行可信验证，并在应用程序的关键执行环节进行动态可信验证，在检测到其可信性受到破坏后进行报警，并将验证结果形成审计记录送至安全管理中心。",
+                "implementation": [
+                    "应核查是否基于可信根对计算设备的系统引导程序、系统程序、重要配置参数和应用程序等进行可信验证；",
+                    "应核查是否在应用程序的关键执行环节进行动态可信验证；",
+                    "应测试验证当检测到计算设备的可信性受到破坏后是否进行报警；",
+                    "应测试验证结果是否以审计记录的形式送至安全管理中心。",
+                ],
+            },
+        },
+    },
+    "data_integrity": {
+        "title": "8.1.4.7 数据完整性",
+        "items": {
+            "L3-CES1-25": {
+                "indicator": "应采用校验技术或密码技术保证重要数据在传输过程中的完整性，包括但不限于鉴别数据、重要业务数据、重要审计数据、重要配置数据、重要视频数据和重要个人信息等。",
+                "implementation": [
+                    "应核查系统设计文档，鉴别数据、重要业务数据、重要审计数据、重要配置数据、重要视频数据和重要个人信息等在传输过程中是否采用了校验技术或密码技术保证完整性；",
+                    "应测试验证在传输过程中对鉴别数据、重要业务数据、重要审计数据、重要配置数据、重要视频数据和重要个人信息等进行篡改，是否能够检测到数据在传输过程中的完整性受到破坏并能够及时恢复。",
+                ],
+            },
+            "L3-CES1-26": {
+                "indicator": "应采用校验技术或密码技术保证重要数据在存储过程中的完整性，包括但不限于鉴别数据、重要业务数据、重要审计数据、重要配置数据、重要视频数据和重要个人信息等。",
+                "implementation": [
+                    "应核查设计文档，是否采用了校验技术或密码技术保证鉴别数据、重要业务数据、重要审计数据、重要配置数据、重要视频数据和重要个人信息等在存储过程中的完整性；",
+                    "应核查是否采用技术措施（如数据安全保护系统等）保证鉴别数据、重要业务数据、重要审计数据、重要配置数据、重要视频数据和重要个人信息等在存储过程中的完整性；",
+                    "应测试验证在存储过程中对鉴别数据、重要业务数据、重要审计数据、重要配置数据、重要视频数据和重要个人信息等进行篡改，是否能够检测到数据在存储过程中的完整性受到破坏并能够及时恢复。",
+                ],
+            },
+        },
+    },
+    "data_confidentiality": {
+        "title": "8.1.4.8 数据保密性",
+        "items": {
+            "L3-CES1-27": {
+                "indicator": "应采用密码技术保证重要数据在传输过程中的保密性，包括但不限于鉴别数据、重要业务数据和重要个人信息等。",
+                "implementation": [
+                    "应核查系统设计文档，鉴别数据、重要业务数据和重要个人信息等在传输过程中是否采用密码技术保证保密性；",
+                    "应通过嗅探等方式抓取传输过程中的数据包，鉴别数据、重要业务数据和重要个人信息等在传输过程中是否进行了加密处理。",
+                ],
+            },
+            "L3-CES1-28": {
+                "indicator": "应采用密码技术保证重要数据在存储过程中的保密性，包括但不限于鉴别数据、重要业务数据和重要个人信息等。",
+                "implementation": [
+                    "应核查是否采用密码技术保证鉴别数据、重要业务数据和重要个人信息等在存储过程中的保密性；",
+                    "应核查是否采用技术措施（如数据安全保护系统等）保证鉴别数据、重要业务数据和重要个人信息等在存储过程中的保密性；",
+                    "应测试验证是否对指定的数据进行加密处理。",
+                ],
+            },
+        },
+    },
+    "data_backup_recovery": {
+        "title": "8.1.4.9 数据备份恢复",
+        "items": {
+            "L3-CES1-29": {
+                "indicator": "应提供重要数据的本地数据备份与恢复功能。",
+                "implementation": [
+                    "应核查是否按照备份策略进行本地备份；",
+                    "应核查备份策略设置是否合理、配置是否正确；",
+                    "应核查备份结果是否与备份策略一致；",
+                    "应核查近期恢复测试记录是否能够进行正常的数据恢复。",
+                ],
+            },
+            "L3-CES1-30": {
+                "indicator": "应提供异地实时备份功能，利用通信网络将重要数据实时备份至备份场地。",
+                "implementation": [
+                    "应核查是否提供异地实时备份功能，并通过网络将重要配置数据、重要业务数据实时备份至备份场地。",
+                ],
+            },
+            "L3-CES1-31": {
+                "indicator": "应提供重要数据处理系统的热冗余，保证系统的高可用性。",
+                "implementation": [
+                    "应核查重要数据处理系统（包括边界路由器、边界防火墙、核心交换机、应用服务器和数据库服务器等）是否采用热冗余方式部署。",
+                ],
+            },
+        },
+    },
+    "residual_information": {
+        "title": "8.1.4.10 剩余信息保护",
+        "items": {
+            "L3-CES1-32": {
+                "indicator": "应保证鉴别信息所在的存储空间被释放或重新分配前得到完全清除。",
+                "implementation": [
+                    "应核查相关配置信息或系统设计文档，用户的鉴别信息所在的存储空间被释放或重新分配前是否得到完全清除。",
+                ],
+            },
+            "L3-CES1-33": {
+                "indicator": "应保证存有敏感数据的存储空间被释放或重新分配前得到完全清除。",
+                "implementation": [
+                    "应核查相关配置信息或系统设计文档，敏感数据所在的存储空间被释放或重新分配给其他用户前是否得到完全清除。",
+                ],
+            },
+        },
+    },
+    "personal_information": {
+        "title": "8.1.4.11 个人信息保护",
+        "items": {
+            "L3-CES1-34": {
+                "indicator": "应仅采集和保存业务必需的用户个人信息。",
+                "implementation": [
+                    "应核查采集的用户个人信息是否是业务应用必需的；",
+                    "应核查是否制定了有关用户个人信息保护的管理制度和流程。",
+                ],
+            },
+            "L3-CES1-35": {
+                "indicator": "应禁止未授权访问和非法使用用户个人信息。",
+                "implementation": [
+                    "应核查是否采用技术措施限制对用户个人信息的访问和使用；",
+                    "应核查是否制定了有关用户个人信息保护的管理制度和流程。",
                 ],
             },
         },
     },
 }
-
 
 NOLOGIN_SHELLS = {
     "/sbin/nologin",
@@ -375,9 +514,7 @@ NOLOGIN_SHELLS = {
     "nologin"
 }
 
-
 INTERACTIVE_SHELLS = {"/bin/bash"}
-
 
 INSECURE_REMOTE_SERVICES = [
     "telnet",
@@ -386,7 +523,6 @@ INSECURE_REMOTE_SERVICES = [
     "rexec",
     "telnetd",
 ]
-
 
 UNNECESSARY_SERVICES = [
     "telnet",
@@ -406,7 +542,6 @@ UNNECESSARY_SERVICES = [
     "xorg-x11-server-Xorg",
 ]
 
-
 STATUS_LABELS = {
     "APPLIED": "已完成",
     "PARTIAL": "部分完成",
@@ -415,6 +550,12 @@ STATUS_LABELS = {
     "FAILED": "失败",
 }
 
+COMPLIANCE_STATUS_LABELS = {
+    "PASS": "符合",
+    "FAIL": "不符合",
+    "ERROR": "检查错误",
+    "UNKNOWN": "未知",
+}
 
 HIGH_RISK_PORTS = {
     21: "FTP",
@@ -441,7 +582,6 @@ HIGH_RISK_PORTS = {
     27017: "MongoDB",
 }
 
-
 PORT_SERVICE_HINTS = {
     21: ["vsftpd", "proftpd", "pure-ftpd", "ftp"],
     23: ["telnet", "telnetd"],
@@ -466,7 +606,6 @@ PORT_SERVICE_HINTS = {
     11211: ["memcached"],
     27017: ["mongod", "mongodb"],
 }
-
 
 MANUAL_REMEDIATION_GUIDES = {
     ("L3-CES1-01", 0): [
@@ -590,12 +729,103 @@ MANUAL_REMEDIATION_GUIDES = {
         "2. 在防护软件策略中配置发现恶意行为时自动隔离/阻断，并开启邮件或日志告警，必要时记录策略名称。",
         "3. 通过下载 EICAR 测试文件或模拟样本验证能够实时阻断，并检查日志/告警是否同步生成。",
     ],
+    ("L3-CES1-09", None): [
+        "1. 访谈系统授权管理员，确认由哪些主体负责制定与发布访问控制策略，并记录授权凭据。",
+        "2. 对照安全策略检查 ACL、文件权限或数据库授权配置，确保主体对客体的访问规则均已受控并可追溯。",
+        "3. 选取敏感资源进行越权访问尝试，验证策略是否有效拦截并记录结果。",
+    ],
+    ("L3-CES1-10", None): [
+        "1. 抽查应用与数据库权限模型，确认控制粒度已经细化到用户/进程与文件、表、记录或字段级。",
+        "2. 对比需求文档与实际权限，记录是否存在仅目录级或库级授权的粗粒度情形。",
+        "3. 针对发现的粗粒度授权，制定细化方案并安排变更窗口实施。",
+    ],
+    ("L3-CES1-15", None): [
+        "1. 列出审计服务（如 auditd/rsyslog）对应的进程与 systemd 单元，确认已启用保护策略。",
+        "2. 使用非审计管理员账户尝试停止或卸载审计服务，验证是否被权限或安全策略阻止。",
+        "3. 如可被中断，请收紧系统权限或添加 service 硬ening（如 `RefuseManualStop=yes`），并记录验证结果。",
+    ],
+    ("L3-CES1-20", None): [
+        "1. 查阅设计/接口文档，识别输入校验模块或中间件配置（如 WAF、参数校验库）。",
+        "2. 通过手工或自动化测试提交超长、非法格式、注入类输入，确认系统能够拦截或返回校验错误。",
+        "3. 对缺失校验的接口，补充后端验证或前置网关规则，并补充回归测试用例。",
+    ],
+    ("L3-CES1-21", None): [
+        "1. 使用漏洞扫描/渗透工具对目标进行评估，收集高危漏洞列表与风险等级。",
+        "2. 针对发现的漏洞制定修补计划并在测试环境验证补丁或配置变更的兼容性。",
+        "3. 在生产实施修复后复扫确认漏洞已关闭，并记录审批与回归结果。",
+    ],
+    ("L3-CES1-22", None): [
+        "1. 核查入侵检测/防御系统或主机安全代理的部署情况，确认告警通道可用。",
+        "2. 通过模拟入侵事件（如端口扫描、暴力破解尝试）验证是否生成告警并能及时通知。",
+        "3. 若缺失检测或告警，请部署 IDS/EDR 并配置升级与告警接收人。",
+    ],
+    ("L3-CES1-24", None): [
+        "1. 审阅可信计算或安全启动方案，确认 BIOS/BootLoader/系统文件已纳入可信根校验范围。",
+        "2. 检查是否启用运行时完整性/白名单机制，并对关键执行环节进行动态验证。",
+        "3. 模拟篡改后验证能否触发告警并生成审计记录上报安全管理中心。",
+    ],
+    ("L3-CES1-25", None): [
+        "1. 检查传输层是否启用 TLS/IPsec/消息签名，确认覆盖鉴别、业务、审计等重要数据。",
+        "2. 通过抓包或篡改测试验证数据被修改后能被校验/加密机制检测并拒绝。",
+        "3. 对未加密或未校验链路，补充传输加密或报文完整性校验配置。",
+    ],
+    ("L3-CES1-26", None): [
+        "1. 核查数据库、存储或配置库是否启用校验或防篡改机制（如校验和、HMAC、AIDE）。",
+        "2. 模拟修改关键数据文件，验证完整性监测是否告警并能恢复。",
+        "3. 对缺失保护的数据存储启用校验/签名或部署完整性监测工具。",
+    ],
+    ("L3-CES1-27", None): [
+        "1. 确认重要数据传输已使用加密隧道（HTTPS/SSH/VPN）或应用层加密。",
+        "2. 抓包检查是否仍存在明文鉴别数据或个人信息，必要时启用强制加密。",
+        "3. 更新设计文档及配置，确保传输加密范围覆盖所有敏感链路。",
+    ],
+    ("L3-CES1-28", None): [
+        "1. 核实数据库、文件系统或备份介质对重要数据是否启用加密存储。",
+        "2. 检查密钥管理方案与访问控制，避免未授权解密。",
+        "3. 对未加密的敏感数据启用加密或调整访问策略，并记录验证结果。",
+    ],
+    ("L3-CES1-29", None): [
+        "1. 评估当前备份策略与计划任务，确认本地备份周期、保留期与内容符合要求。",
+        "2. 抽查备份产物的完整性与可用性，执行恢复演练并记录成功率。",
+        "3. 如未覆盖关键数据或恢复失败，调整备份工具与策略并复测。",
+    ],
+    ("L3-CES1-30", None): [
+        "1. 核查是否存在异地实时备份链路/服务，确认同步范围与带宽。",
+        "2. 验证数据在备份站点的可用性与一致性，评估延迟与故障切换流程。",
+        "3. 若缺失该能力，规划备份链路或云端复制方案并评估安全加固措施。",
+    ],
+    ("L3-CES1-31", None): [
+        "1. 盘点边界设备、核心交换、应用与数据库节点的冗余部署情况。",
+        "2. 检查负载均衡/双机热备配置并执行切换演练，确认服务不中断。",
+        "3. 对单点风险组件制定热备方案并提交变更实施。",
+    ],
+    ("L3-CES1-32", None): [
+        "1. 审核身份鉴别信息的存储与销毁流程，确认介质/内存释放前有清除机制。",
+        "2. 通过测试账户删除或密码重置流程，验证敏感残留是否被彻底清理。",
+        "3. 对发现的残留风险补充擦除命令或安全清除策略。",
+    ],
+    ("L3-CES1-33", None): [
+        "1. 审核敏感数据存储位置与释放流程，确认重分配前执行了覆写或加密擦除。",
+        "2. 抽样验证卷/对象删除后的残留情况，必要时使用安全擦除工具。",
+        "3. 补充清除策略与审计记录，确保敏感空间在分配前已净化。",
+    ],
+    ("L3-CES1-34", None): [
+        "1. 对照业务清单审查采集字段，确认仅保留业务必需的个人信息。",
+        "2. 检查并完善个人信息保护制度、告知与同意流程。",
+        "3. 删除或匿名化非必要字段，并记录变更审批。",
+    ],
+    ("L3-CES1-35", None): [
+        "1. 检查访问控制、脱敏/最小化展示与审计策略是否覆盖个人信息数据。",
+        "2. 核查相关管理制度与操作流程，确保未授权访问可被阻止并追责。",
+        "3. 对发现的未授权访问路径进行封堵或细化权限，并完善日志审计。",
+    ],
 
 }
 
-
 class LinuxComplianceChecker:
     """Implements the third-level compliance checks defined in section 8.1.4."""
+
+    REPORT_EXTENSION = ".md"
 
     def __init__(self) -> None:
         self.results: Dict[str, Dict[str, object]] = {}
@@ -629,6 +859,19 @@ class LinuxComplianceChecker:
             ("L3-CES1-18", 0): self.remediate_disable_unnecessary_services,
             ("L3-CES1-18", 1): self.remediate_high_risk_ports,
         }
+
+    def build_markdown_report_path(
+        self, prefix: str, timestamp: Optional[str] = None
+    ) -> str:
+        """Return a Markdown report filename with a consistent extension."""
+
+        resolved_timestamp = timestamp or datetime.now().strftime("%Y%m%d_%H%M%S")
+        extension = (
+            self.REPORT_EXTENSION
+            if self.REPORT_EXTENSION.startswith(".")
+            else f".{self.REPORT_EXTENSION}"
+        )
+        return f"{prefix}{resolved_timestamp}{extension}"
 
     @staticmethod
     def get_os_info() -> Dict[str, str]:
@@ -1166,6 +1409,8 @@ class LinuxComplianceChecker:
                 overall_status = "FAIL"
             elif status == "ERROR" and overall_status != "FAIL":
                 overall_status = "ERROR"
+            elif status not in {"PASS", "FAIL", "ERROR"} and overall_status == "PASS":
+                overall_status = status
 
             aggregated_details.append(f"[{status}] {sub['description']}")
             for detail in sub.get("details", []):
@@ -1683,6 +1928,12 @@ class LinuxComplianceChecker:
         return STATUS_LABELS.get(status, status)
 
     @staticmethod
+    def format_compliance_status(status: str) -> str:
+        """Translate合规性检查状态到中文，便于在报告中直观展示。"""
+
+        return COMPLIANCE_STATUS_LABELS.get(status, status)
+
+    @staticmethod
     def render_heading(
         text: str,
         level: int = 1,
@@ -1723,6 +1974,91 @@ class LinuxComplianceChecker:
 
         style = colour or default_colour
         return f"{style}{heading}{Colors.END}"
+
+    @staticmethod
+    def render_markdown_heading(text: str, level: int = 1) -> str:
+        """Render a Markdown heading with a trailing blank line."""
+
+        sanitized = (text or "").strip()
+        if not sanitized:
+            return ""
+
+        prefix = "#" * max(level, 1)
+        return f"{prefix} {sanitized}\n\n"
+
+    @staticmethod
+    def write_markdown_metadata(report: TextIO, metadata: Dict[str, str]) -> None:
+        """Write a block of key-value metadata as a Markdown table."""
+
+        if not metadata:
+            return
+
+        rows = [[key, value] for key, value in metadata.items() if value]
+        report.write(
+            LinuxComplianceChecker.render_markdown_table(
+                ["字段", "值"], rows
+            )
+        )
+
+    @staticmethod
+    def render_markdown_table(headers: List[str], rows: List[List[object]]) -> str:
+        """Render a Markdown table with escaped content and a trailing blank line."""
+
+        if not headers:
+            return ""
+
+        def escape_cell(cell: object) -> str:
+            if cell is None:
+                return ""
+            return str(cell).replace("|", "\\|").replace("\n", "<br>")
+
+        column_count = len(headers)
+        header_line = " | ".join(escape_cell(header) for header in headers)
+        divider = " | ".join("---" for _ in headers)
+        lines = [f"| {header_line} |", f"| {divider} |"]
+
+        for row in rows:
+            padded = list(row) + [""] * (column_count - len(row))
+            cells = " | ".join(
+                escape_cell(cell) for cell in padded[:column_count]
+            )
+            lines.append(f"| {cells} |")
+
+        lines.append("")
+        return "\n".join(lines)
+
+    def render_markdown_cover(
+        self,
+        subject_placeholder: str,
+        report_title: str,
+        report_number: str = "XXXXXXXXXXXX-XX-XXXX-XX",
+        client_label: str = "委托单位",
+        assessor_label: str = "测评单位",
+        report_time_label: str = "报告时间",
+    ) -> str:
+        """Render a cover page block for Markdown reports."""
+
+        rows = [
+            [client_label, "______________"],
+            [assessor_label, "______________"],
+            [report_time_label, "____年____月"],
+        ]
+
+        parts = [
+            "<div align=\"center\">",
+            f"**报告编号：** {report_number}",
+            "",
+            "# 网络安全等级保护",
+            f"## {subject_placeholder}{report_title}",
+            "</div>",
+            "",
+            self.render_markdown_table(["字段", "内容"], rows).rstrip(),
+            "",
+            "<div style=\"page-break-after: always;\"></div>",
+            "",
+        ]
+
+        return "\n".join(parts)
 
     @staticmethod
     def emphasise_primary_text(text: str) -> str:
@@ -2639,7 +2975,6 @@ class LinuxComplianceChecker:
             print(f"{Colors.RED}错误: 部分检查需要root权限{Colors.END}")
             return False
         return True
-
 
     def run_check(self, modules: Optional[List[str]] = None) -> None:
         active_modules = modules or list(MODULE_METHODS.keys())
@@ -3787,6 +4122,46 @@ class LinuxComplianceChecker:
             subitems[2]["recommendation"].append("请确认sudo已安装并配置最小权限策略")
 
         self.finalize_item(item, subitems)
+    def check_ces1_09_policy_configuration(self) -> None:
+        item = "L3-CES1-09"
+        subitems = [
+            self.make_subitem("1. 应核查是否由授权主体负责配置访问控制策略"),
+            self.make_subitem("2. 应核查授权主体是否依据安全策略配置访问规则"),
+            self.make_subitem("3. 应测试验证用户是否有可越权访问情形"),
+        ]
+
+        for sub in subitems:
+            sub["status"] = "UNKNOWN"
+            sub["details"].append("该子项需通过访谈与人工验证完成，未自动化评估。")
+        subitems[1]["details"].append("请对照安全策略与访问控制列表核查配置责任主体和审批记录。")
+        subitems[2]["details"].append("建议选取敏感资源执行越权尝试，记录拦截和审计结果。")
+        subitems[0]["details"].append(
+            "检测步骤：1）访谈安全负责人确认授权主体名单；2）查阅变更/审批记录核实授权链路；3）截图留证形成佐证材料。"
+        )
+        subitems[1]["details"].append(
+            "检测步骤：1）提取 ACL/策略配置，与安全策略逐条对照；2）记录发现的缺失规则；3）如有差异，标记为风险并提交整改。"
+        )
+        subitems[2]["details"].append(
+            "检测步骤：1）选择敏感客体与高权限账号组合；2）以非授权主体尝试读/写/管理操作；3）保存日志/截图，评估是否存在越权。"
+        )
+
+        self.finalize_item(item, subitems)
+    def check_ces1_10_access_control_granularity(self) -> None:
+        item = "L3-CES1-10"
+        subitems = [
+            self.make_subitem("应核查访问控制策略的控制粒度是否达到用户/进程-文件/表/字段级"),
+        ]
+
+        subitems[0]["status"] = "UNKNOWN"
+        subitems[0]["details"].append("该子项需人工审阅权限模型与访问控制策略粒度。")
+        subitems[0]["recommendation"].append(
+            "请对照需求与数据分级，确认权限控制细化到用户或进程级、文件/表/字段级，并记录发现。"
+        )
+        subitems[0]["details"].append(
+            "检测步骤：1）调阅系统/数据库权限矩阵，确认主体粒度是否到用户或进程级；2）抽查关键资源权限，核对是否细化到文件/表/字段；3）记录缺口并提出调整计划。"
+        )
+
+        self.finalize_item(item, subitems)
     def check_ces1_11_security_labels(self) -> None:
         item = "L3-CES1-11"
         subitems = [
@@ -4273,6 +4648,22 @@ class LinuxComplianceChecker:
             subitems[1]["details"].append("日志轮转配置包含保留策略并已启用压缩归档")
 
         self.finalize_item(item, subitems)
+    def check_ces1_15_audit_process_protection(self) -> None:
+        item = "L3-CES1-15"
+        subitems = [
+            self.make_subitem("应测试验证审计进程是否受到保护，防止未经授权中断"),
+        ]
+
+        subitems[0]["status"] = "UNKNOWN"
+        subitems[0]["details"].append("该检查需通过非审计管理员账户执行中断测试，暂未自动化。")
+        subitems[0]["recommendation"].append(
+            "请模拟停止 auditd/rsyslog 等审计服务，确认权限或保护策略能够阻止未授权中断。"
+        )
+        subitems[0]["details"].append(
+            "检测步骤：1）列出审计进程与 systemd 单元；2）使用普通账号执行 systemctl stop/kill，观察是否被拒绝；3）查看日志确认拦截记录并截图存档。"
+        )
+
+        self.finalize_item(item, subitems)
     def check_ces1_17_minimal_installation(self) -> None:
         item = "L3-CES1-17"
         subitems = [
@@ -4747,6 +5138,67 @@ class LinuxComplianceChecker:
             subitems[0]["recommendation"].append("请使用AllowUsers/防火墙策略限制可访问的管理终端")
 
         self.finalize_item(item, subitems)
+    def check_ces1_20_input_validation(self) -> None:
+        item = "L3-CES1-20"
+        subitems = [
+            self.make_subitem("1. 应核查设计中是否包含数据有效性检验功能"),
+            self.make_subitem("2. 应测试验证接口输入是否进行有效性校验"),
+        ]
+
+        for index, message in enumerate(
+            [
+                "请审阅设计/需求文档，确认数据有效性校验模块覆盖人机接口与通信接口。",
+                "需通过手工或自动化测试提交异常输入，验证系统是否拦截或提示错误。",
+            ]
+        ):
+            subitems[index]["status"] = "UNKNOWN"
+            subitems[index]["details"].append(message)
+        subitems[0]["details"].append(
+            "检测步骤：1）获取接口列表与字段校验规则；2）核查是否存在必填、长度、格式、白名单/黑名单校验；3）记录未覆盖的字段并建议补充。"
+        )
+        subitems[1]["details"].append(
+            "检测步骤：1）准备越界、恶意字符、空值等测试用例；2）对人机界面和 API 逐项提交，观察返回码与日志；3）形成测试记录，标记未拦截的情形。"
+        )
+
+        self.finalize_item(item, subitems)
+    def check_ces1_21_vulnerability_management(self) -> None:
+        item = "L3-CES1-21"
+        subitems = [
+            self.make_subitem("1. 应核查是否不存在高风险漏洞"),
+            self.make_subitem("2. 应核查漏洞是否经过测试评估后及时修补"),
+        ]
+
+        subitems[0]["status"] = "UNKNOWN"
+        subitems[0]["details"].append("需要运行漏洞扫描/渗透测试并人工确认结果，未自动化。")
+        subitems[1]["status"] = "UNKNOWN"
+        subitems[1]["details"].append("请检查补丁管理流程与变更记录，核实修补时效与验证。")
+        subitems[0]["details"].append(
+            "检测步骤：1）使用合规授权的扫描工具对目标资产执行高危漏洞扫描；2）导出报告并筛选高危/严重项；3）与资产负责人确认漏洞真实性并记录。"
+        )
+        subitems[1]["details"].append(
+            "检测步骤：1）查阅补丁/变更工单与实施记录，核对修复时间是否满足策略；2）在测试/生产复扫验证漏洞关闭；3）记录未修复或延期原因。"
+        )
+
+        self.finalize_item(item, subitems)
+    def check_ces1_22_intrusion_detection_alerts(self) -> None:
+        item = "L3-CES1-22"
+        subitems = [
+            self.make_subitem("1. 应核查是否有入侵检测的措施"),
+            self.make_subitem("2. 应核查发生严重入侵事件时是否提供报警"),
+        ]
+
+        for sub in subitems:
+            sub["status"] = "UNKNOWN"
+            sub["details"].append("需要访谈与告警演练验证，暂未自动化。")
+        subitems[1]["details"].append("请模拟入侵事件验证告警通道与响应流程。")
+        subitems[0]["details"].append(
+            "检测步骤：1）盘点现有 IDS/IPS/EDR/主机防护部署；2）核查策略更新时间与覆盖资产清单；3）截取告警面板或配置作为证据。"
+        )
+        subitems[1]["details"].append(
+            "检测步骤：1）模拟端口扫描/暴力破解等事件；2）确认是否产生告警并能送达安全团队；3）记录告警内容、响应时间与处置结果。"
+        )
+
+        self.finalize_item(item, subitems)
     def check_ces1_23_malware_protection(self) -> None:
         item = "L3-CES1-23"
         subitems = [
@@ -5022,6 +5474,187 @@ class LinuxComplianceChecker:
             subitems[2]["details"].extend(service_details)
 
         self.finalize_item(item, subitems)
+    def check_ces1_24_trusted_verification(self) -> None:
+        item = "L3-CES1-24"
+        subitems = [
+            self.make_subitem("1. 应核查是否基于可信根进行系统引导和关键组件可信验证"),
+            self.make_subitem("2. 应核查是否在关键执行环节进行动态可信验证"),
+            self.make_subitem("3. 应测试验证可信性被破坏时是否报警"),
+            self.make_subitem("4. 应测试验证是否将可信验证结果形成审计记录并送至安全管理中心"),
+        ]
+
+        for sub in subitems:
+            sub["status"] = "UNKNOWN"
+            sub["details"].append("该检查依赖可信计算方案与演练，需人工确认。")
+        subitems[2]["details"].append("请模拟篡改或验证失败场景，确认告警链路有效。")
+        subitems[3]["details"].append("请检查审计日志与上报机制，验证记录是否送达安全管理中心。")
+
+        self.finalize_item(item, subitems)
+    def check_ces1_25_integrity_transmission(self) -> None:
+        item = "L3-CES1-25"
+        subitems = [
+            self.make_subitem("1. 应核查传输过程中是否采用校验或密码技术保证完整性"),
+            self.make_subitem("2. 应测试验证篡改是否能被检测并恢复"),
+        ]
+
+        subitems[0]["status"] = "UNKNOWN"
+        subitems[0]["details"].append("需审阅设计文档与网络抓包，确认重要数据传输完整性保护。")
+        subitems[1]["status"] = "UNKNOWN"
+        subitems[1]["details"].append("请通过篡改测试验证完整性校验/加密能否发现并阻断异常。")
+
+        self.finalize_item(item, subitems)
+    def check_ces1_26_integrity_storage(self) -> None:
+        item = "L3-CES1-26"
+        subitems = [
+            self.make_subitem("1. 应核查存储过程是否采用校验或密码技术保证完整性"),
+            self.make_subitem("2. 应核查是否采用技术措施保证存储完整性"),
+            self.make_subitem("3. 应测试验证存储篡改是否可检测并恢复"),
+        ]
+
+        for sub in subitems:
+            sub["status"] = "UNKNOWN"
+        subitems[0]["details"].append("请检查数据库/存储设计，确认敏感数据存储启用校验或签名。")
+        subitems[1]["details"].append("建议核查完整性监测、WORM或数据防篡改方案是否部署。")
+        subitems[2]["details"].append("需通过模拟篡改验证告警与恢复能力。")
+
+        self.finalize_item(item, subitems)
+    def check_ces1_27_confidentiality_transmission(self) -> None:
+        item = "L3-CES1-27"
+        subitems = [
+            self.make_subitem("1. 应核查重要数据在传输过程中是否采用密码技术保证保密性"),
+            self.make_subitem("2. 应验证传输数据包是否经过加密处理"),
+        ]
+
+        subitems[0]["status"] = "UNKNOWN"
+        subitems[0]["details"].append("需审核设计与配置，确认敏感链路已启用传输加密。")
+        subitems[1]["status"] = "UNKNOWN"
+        subitems[1]["details"].append("请通过抓包或嗅探验证数据是否加密，记录验证时间与范围。")
+
+        self.finalize_item(item, subitems)
+    def check_ces1_28_confidentiality_storage(self) -> None:
+        item = "L3-CES1-28"
+        subitems = [
+            self.make_subitem("1. 应核查存储过程是否采用密码技术保证保密性"),
+            self.make_subitem("2. 应核查技术措施是否保障存储保密性"),
+            self.make_subitem("3. 应测试验证指定数据是否进行了加密处理"),
+        ]
+
+        for sub in subitems:
+            sub["status"] = "UNKNOWN"
+        subitems[0]["details"].append("请审阅存储加密/密钥管理方案，确认覆盖鉴别数据与重要业务数据。")
+        subitems[1]["details"].append("核查数据安全保护系统或磁盘/数据库加密是否到位。")
+        subitems[2]["details"].append("建议抽样数据进行加密性验证，确保明文不落盘。")
+
+        self.finalize_item(item, subitems)
+    def check_ces1_29_local_backup_recovery(self) -> None:
+        item = "L3-CES1-29"
+        subitems = [
+            self.make_subitem("1. 应核查是否按照备份策略进行本地备份"),
+            self.make_subitem("2. 应核查备份策略设置是否合理、配置是否正确"),
+            self.make_subitem("3. 应核查备份结果是否与备份策略一致"),
+            self.make_subitem("4. 应核查近期恢复测试记录是否能够正常恢复"),
+        ]
+
+        for sub in subitems:
+            sub["status"] = "UNKNOWN"
+            sub["details"].append("需审核备份/恢复记录与策略配置，暂未自动化。")
+        subitems[3]["details"].append("请执行恢复演练并记录结果，确保满足合规要求。")
+        subitems[0]["details"].append(
+            "检测步骤：1）收集备份策略与计划任务；2）核查备份时间表与成功日志；3）抽查最近一次备份文件是否存在。"
+        )
+        subitems[1]["details"].append(
+            "检测步骤：1）审阅保留周期、加密、存储位置等配置；2）确认与业务 RTO/RPO 一致；3）记录配置截图与审批记录。"
+        )
+        subitems[2]["details"].append(
+            "检测步骤：1）抽样比对备份内容与生产数据；2）验证校验和或文件数量匹配；3）记录差异并提出修正计划。"
+        )
+        subitems[3]["details"].append(
+            "检测步骤：1）选择最近备份执行恢复演练；2）验证业务可用性与数据完整性；3）保存演练结果与缺陷清单。"
+        )
+
+        self.finalize_item(item, subitems)
+    def check_ces1_30_remote_backup(self) -> None:
+        item = "L3-CES1-30"
+        subitems = [self.make_subitem("应核查是否提供异地实时备份功能并实时同步重要数据")]
+
+        subitems[0]["status"] = "UNKNOWN"
+        subitems[0]["details"].append("请核查异地备份链路、同步范围与监控记录，未自动化检测。")
+        subitems[0]["details"].append(
+            "检测步骤：1）确认是否存在专线/VPN/云复制通道；2）核查同步范围、延迟与监控告警；3）在备份站点抽样验证数据可用性。"
+        )
+
+        self.finalize_item(item, subitems)
+    def check_ces1_31_hot_redundancy(self) -> None:
+        item = "L3-CES1-31"
+        subitems = [self.make_subitem("应核查重要数据处理系统是否采用热冗余部署")]
+
+        subitems[0]["status"] = "UNKNOWN"
+        subitems[0]["details"].append("需盘点关键节点冗余架构并通过切换演练验证，未自动化。")
+        subitems[0]["details"].append(
+            "检测步骤：1）梳理边界/核心/应用/数据库节点部署架构；2）确认是否存在双机/集群/负载均衡配置；3）执行或调阅切换演练记录，验证不中断。"
+        )
+
+        self.finalize_item(item, subitems)
+    def check_ces1_32_residual_authentication_clearing(self) -> None:
+        item = "L3-CES1-32"
+        subitems = [self.make_subitem("应核查鉴别信息存储空间释放前是否彻底清除")]
+
+        subitems[0]["status"] = "UNKNOWN"
+        subitems[0]["details"].append("请审查账户删除/重置流程，确认鉴别信息清除机制，未自动化。")
+        subitems[0]["details"].append(
+            "检测步骤：1）审阅账户生命周期与密码重置流程，确认包含安全清除步骤；2）抽样删除/重置测试账户后检查 shadow/缓存文件是否残留；3）如有残留，补充清除脚本并记录结果。"
+        )
+
+        self.finalize_item(item, subitems)
+    def check_ces1_33_residual_sensitive_clearing(self) -> None:
+        item = "L3-CES1-33"
+        subitems = [self.make_subitem("应核查敏感数据存储空间释放或分配前是否清除")]
+
+        subitems[0]["status"] = "UNKNOWN"
+        subitems[0]["details"].append("需验证敏感数据存储的擦除/覆写流程是否执行，暂未自动化。")
+        subitems[0]["details"].append(
+            "检测步骤：1）确认敏感数据存储位置与介质；2）模拟删除/重分配后使用恢复工具检查是否有残留；3）验证安全擦除/覆写策略生效并形成报告。"
+        )
+
+        self.finalize_item(item, subitems)
+    def check_ces1_34_personal_info_minimization(self) -> None:
+        item = "L3-CES1-34"
+        subitems = [
+            self.make_subitem("1. 应核查采集的用户个人信息是否是业务必需"),
+            self.make_subitem("2. 应核查是否制定了个人信息保护的管理制度和流程"),
+        ]
+
+        for sub in subitems:
+            sub["status"] = "UNKNOWN"
+        subitems[0]["details"].append("请对照业务场景审查采集字段，确认最小化原则。")
+        subitems[1]["details"].append("需核查制度/流程文件，确保个人信息保护措施落实。")
+        subitems[0]["details"].append(
+            "检测步骤：1）列出所有采集字段与用途，对照业务必要性；2）检查是否存在超出目的的字段并标记；3）出具精简建议并确认实施记录。"
+        )
+        subitems[1]["details"].append(
+            "检测步骤：1）收集个人信息保护制度、告知与同意模板；2）核查审批与培训记录；3）确认制度涵盖采集、使用、存储、共享、删除等全流程。"
+        )
+
+        self.finalize_item(item, subitems)
+    def check_ces1_35_personal_info_protection(self) -> None:
+        item = "L3-CES1-35"
+        subitems = [
+            self.make_subitem("1. 应核查是否采用技术措施限制对个人信息的访问和使用"),
+            self.make_subitem("2. 应核查是否制定了个人信息保护的管理制度和流程"),
+        ]
+
+        for sub in subitems:
+            sub["status"] = "UNKNOWN"
+        subitems[0]["details"].append("请检查访问控制、脱敏与审计措施是否覆盖个人信息。")
+        subitems[1]["details"].append("需审阅制度流程，确认未授权访问可追责并受控。")
+        subitems[0]["details"].append(
+            "检测步骤：1）审查权限、脱敏、加密和日志配置是否覆盖个人信息库/表；2）模拟未授权账号访问，验证被拒绝并有审计；3）记录测试证据与日志。"
+        )
+        subitems[1]["details"].append(
+            "检测步骤：1）查阅个人信息访问审批、最小化授权与定期审计流程；2）核实违规访问处置记录；3）确认流程与技术控制闭环。"
+        )
+
+        self.finalize_item(item, subitems)
     def generate_report(self) -> None:
         print(f"\n{Colors.CYAN}=== 三级等保合规检查报告 ==={Colors.END}")
         print(f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -5132,71 +5765,96 @@ class LinuxComplianceChecker:
             )
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        report_file = f"compliance_report_{timestamp}.txt"
+        report_file = self.build_markdown_report_path(
+            "compliance_report_", timestamp
+        )
         with open(report_file, "w", encoding="utf-8") as report:
-            report.write("=== 三级等保合规检查报告 ===\n")
-            report.write(f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            report.write(f"系统信息: {self.os_info['distribution']} {self.os_info['machine']}\n\n")
+            report.write(
+                self.render_markdown_cover(
+                    subject_placeholder="[被测对象名称]",
+                    report_title="等级测评报告",
+                )
+            )
+            self.write_markdown_metadata(
+                report,
+                {
+                    "生成时间": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "系统信息": f"{self.os_info['distribution']} {self.os_info['machine']}",
+                    "执行模块": ", ".join(
+                        CHECK_MODULES[module]["title"] for module in active_modules
+                    ),
+                },
+            )
             for module in active_modules:
                 data = CHECK_ITEMS.get(module)
                 if not data:
                     continue
-                report.write("\n")
-                report.write(self.render_heading(data['title'], level=1, plain=True))
-                report.write("\n")
+                report.write(self.render_markdown_heading(data['title'], level=2))
                 for item_id, metadata in data['items'].items():
                     result = self.results.get(item_id, {"status": "UNKNOWN", "details": [], "recommendation": "", "subitems": []})
                     status = result['status']
-                    report.write("\n")
+                    status_label = self.format_compliance_status(status)
                     report.write(
-                        self.render_heading(
-                            f"{item_id} · {status}",
-                            level=2,
-                            plain=True,
+                        self.render_markdown_heading(
+                            f"{item_id} · {status_label} ({status})", level=3
                         )
                     )
-                    report.write("\n")
                     indicator = metadata.get('indicator')
                     if indicator:
-                        report.write(f"   - 测评指标: {indicator}\n")
+                        report.write(f"- 测评指标: {indicator}\n")
                     implementation = metadata.get('implementation', [])
                     if implementation:
-                        report.write("   - 测评实施包括以下内容:\n")
+                        report.write("- 测评实施包括以下内容:\n")
                         for step in implementation:
-                            report.write(f"     * {step}\n")
+                            report.write(f"  - {step}\n")
                     subitems = result.get('subitems', [])
                     if subitems:
-                        report.write("   - 子项检查结果:\n")
+                        rows: List[List[str]] = []
                         for sub in subitems:
-                            report.write(f"     [{sub.get('status', 'PASS')}] {sub['description']}\n")
-                            for detail in sub.get('details', []):
-                                report.write(f"       - {detail}\n")
+                            sub_status = sub.get('status', 'PASS')
+                            sub_label = self.format_compliance_status(sub_status)
+                            detail_text = "<br>".join(sub.get('details', []))
                             recommendations = sub.get('recommendation', [])
-                            if recommendations and sub.get('status') != 'PASS':
-                                for rec in recommendations:
-                                    report.write(f"       整改建议: {rec}\n")
+                            rec_text = "<br>".join(recommendations) if recommendations else ""
+                            rows.append([
+                                sub_label,
+                                sub.get('description', ''),
+                                detail_text,
+                                rec_text,
+                            ])
+
+                        report.write(
+                            self.render_markdown_table(
+                                ["状态", "子项", "检查详情", "整改建议"], rows
+                            )
+                        )
                     else:
                         details = result.get('details', [])
                         if details:
-                            report.write("   - 检查详情:\n")
+                            report.write("- 检查详情:\n")
                             for detail in details:
-                                report.write(f"     * {detail}\n")
+                                report.write(f"  - {detail}\n")
                         recommendation = result.get('recommendation')
                         if recommendation and result['status'] != 'PASS':
-                            report.write(f"   - 整改建议: {recommendation}\n")
-            report.write("\n=== 检查结果汇总 ===\n")
-            report.write(f"符合项: {pass_count}/{total}\n")
-            report.write(f"不符合项: {fail_count}/{total}\n")
-            report.write(f"检查错误: {error_count}/{total}\n")
+                            report.write(f"- 整改建议: {recommendation}\n")
+                    report.write("\n")
+            report.write(self.render_markdown_heading("检查结果汇总", level=2))
+            summary_rows = [
+                [self.format_compliance_status('PASS'), f"{pass_count}/{total}"],
+                [self.format_compliance_status('FAIL'), f"{fail_count}/{total}"],
+                [self.format_compliance_status('ERROR'), f"{error_count}/{total}"],
+            ]
             if skipped:
-                report.write(
-                    "未执行模块: "
-                    + ", ".join(
-                        f"{module}({CHECK_MODULES[module]['title']})" for module in skipped
-                    )
-                    + "\n"
+                skipped_titles = ", ".join(
+                    f"{module}({CHECK_MODULES[module]['title']})" for module in skipped
                 )
-        print(f"\n{Colors.GREEN}报告已保存到: {report_file}{Colors.END}")
+                summary_rows.append(["未执行模块", skipped_titles])
+            report.write(
+                self.render_markdown_table(["类别", "统计"], summary_rows)
+            )
+        print(
+            f"\n{Colors.GREEN}Markdown 合规报告已保存到: {report_file}{Colors.END}"
+        )
 
     def generate_remediation_report(self) -> None:
         """Persist remediation decisions and actions into a report file."""
@@ -5206,45 +5864,70 @@ class LinuxComplianceChecker:
             return
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        report_path = f"remediation_report_{timestamp}.txt"
+        report_path = self.build_markdown_report_path(
+            "remediation_report_", timestamp
+        )
         status_counts: Dict[str, int] = {}
 
         with open(report_path, "w", encoding="utf-8") as report:
-            report.write("=== 三级等保整改报告 ===\n")
-            report.write(f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+            report.write(
+                self.render_markdown_cover(
+                    subject_placeholder="[被测对象名称]",
+                    report_title="等级整改报告",
+                )
+            )
+            self.write_markdown_metadata(
+                report,
+                {
+                    "生成时间": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "整改记录数": str(len(self.remediation_records)),
+                },
+            )
             for record in self.remediation_records:
                 status = record.get("status", "UNKNOWN")
                 status_counts[status] = status_counts.get(status, 0) + 1
                 status_label = self.format_status_label(status)
                 report.write(
-                    f"[{status_label}] {record.get('item_id', '')} - "
-                    f"{record.get('subitem_description', '')}\n"
+                    self.render_markdown_heading(
+                        f"[{status_label}] {record.get('item_id', '')} - {record.get('subitem_description', '')}",
+                        level=2,
+                    )
                 )
+                detail_rows: List[List[str]] = []
                 if record.get("category"):
-                    report.write(f"   所属分类: {record['category']}\n")
+                    detail_rows.append(["所属分类", record["category"]])
                 if record.get("indicator"):
-                    report.write(f"   测评指标: {record['indicator']}\n")
+                    detail_rows.append(["测评指标", record["indicator"]])
                 if record.get("implementation"):
-                    report.write(f"   测评实施要点: {record['implementation']}\n")
-                report.write(
-                    f"   检查初始状态: {record.get('initial_status', '')}\n"
-                )
+                    detail_rows.append(["测评实施要点", record["implementation"]])
+                detail_rows.append([
+                    "检查初始状态",
+                    record.get("initial_status", ""),
+                ])
                 recommendations = record.get("recommendations", []) or []
                 if recommendations:
-                    report.write("   原始整改建议:\n")
-                    for rec in recommendations:
-                        report.write(f"     - {rec}\n")
+                    detail_rows.append([
+                        "原始整改建议",
+                        "<br>".join(recommendations),
+                    ])
                 notes = record.get("notes", []) or []
                 if notes:
-                    report.write("   整改执行情况:\n")
-                    for note in notes:
-                        report.write(f"     - {note}\n")
-                report.write("\n")
+                    detail_rows.append([
+                        "整改执行情况",
+                        "<br>".join(notes),
+                    ])
+                report.write(
+                    self.render_markdown_table(["字段", "内容"], detail_rows)
+                )
 
-            report.write("=== 整改结果汇总 ===\n")
-            for status, count in sorted(status_counts.items()):
-                label = self.format_status_label(status)
-                report.write(f"{label}: {count}\n")
+            report.write(self.render_markdown_heading("整改结果汇总", level=2))
+            summary_rows = [
+                [self.format_status_label(status), str(count)]
+                for status, count in sorted(status_counts.items())
+            ]
+            report.write(
+                self.render_markdown_table(["状态", "数量"], summary_rows)
+            )
 
         self.remediation_report_path = report_path
 
@@ -5252,6 +5935,8 @@ class LinuxComplianceChecker:
         for status, count in sorted(status_counts.items()):
             label = self.format_status_label(status)
             print(f" {label}: {count}")
-        print(f"{Colors.GREEN}整改报告已保存到: {report_path}{Colors.END}")
-if __name__ == "__main__":  # pragma: no cover - CLI entrypoint
+        print(
+            f"{Colors.GREEN}Markdown 整改报告已保存到: {report_path}{Colors.END}"
+        )
+if __name__ == "__main__": 
     sys.exit(main())
