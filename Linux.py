@@ -136,7 +136,7 @@ def run_selected_modules(selected_modules: List[str]) -> int:
     return 0
 def parse_args(argv: List[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Linux 合规性检查器（CLI 占位实现）",
+        description="等保2.0 三级安全计算环境合规检查与整改工具（Linux 版本）",
     )
     parser.add_argument(
         "--include-module",
@@ -5940,3 +5940,4 @@ class LinuxComplianceChecker:
         )
 if __name__ == "__main__": 
     sys.exit(main())
+
